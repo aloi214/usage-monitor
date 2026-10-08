@@ -1,4 +1,4 @@
-//! Kimi Code — one card like OpenCode: Session + Weekly from the
+//! Kimi Code — one card like OpenCode: Session + Weekly/Monthly from the
 //! subscription, plus an API bar from the Moonshot pay-as-you-go wallet
 //! when a key is saved in Settings.
 //!
@@ -362,19 +362,44 @@ fn parse_snapshot(doc: &Value) -> Result<Snapshot, String> {
     let mut metrics = Vec::new();
     let mut weekly_limit = None;
 
-    // Session = rolling 5-hour window (duration 300 TIME_UNIT_MINUTE).
-    for entry in doc.get("limits").and_then(Value::as_array).unwrap_or(&vec![]) {
-        if !is_session_window(entry) {
-            continue;
-        }
-        let node = entry.get("detail").unwrap_or(entry);
-        if let Some(m) = progress_from("Session", node, SESSION_MS) {
+    // Ratio pools supersede the legacy counts. Presence matters: a malformed
+    // new pool must not silently resurrect a stale legacy reading.
+    let usages = doc.get("usages");
+    if let Some(session) = usages.and_then(|u| u.get("limit_5h")) {
+        if let Some(m) = ratio_progress("Session", session, Some(SESSION_MS)) {
             metrics.push(m);
-            break;
+        }
+    } else {
+        // Explicit legacy window metadata is still safe when the new session
+        // pool is absent. Never infer another duration from an unknown pool.
+        for entry in doc.get("limits").and_then(Value::as_array).unwrap_or(&vec![]) {
+            if !is_session_window(entry) {
+                continue;
+            }
+            let node = entry.get("detail").unwrap_or(entry);
+            if let Some(m) = progress_from("Session", node, SESSION_MS) {
+                metrics.push(m);
+                break;
+            }
         }
     }
 
-    if let Some(usage) = doc.get("usage") {
+    if let Some(usages) = usages {
+        for (key, label, period) in [
+            ("limit_7d", "Weekly", Some(WEEK_MS)),
+            ("limit_month_total", "Monthly", None),
+        ] {
+            if let Some(m) = usages.get(key).and_then(|node| ratio_progress(label, node, period)) {
+                metrics.push(m);
+            }
+        }
+        // limit_month_code is a consumption component of the shared monthly
+        // total, not a separate allowance. A monthly reset alone doesn't give
+        // a period start; leave duration unknown rather than assume 30 days.
+    } else if let Some(usage) = doc.get("usage") {
+        // Only the old schema identifies this otherwise unlabelled pool as
+        // weekly. On new responses it must not create a spurious Weekly row
+        // (or infer an old plan tier from an unrelated count).
         weekly_limit = json_f64(usage.get("limit"));
         if let Some(m) = progress_from("Weekly", usage, WEEK_MS) {
             metrics.push(m);
@@ -385,6 +410,17 @@ fn parse_snapshot(doc: &Value) -> Result<Snapshot, String> {
         return Err("usage response had no recognizable limit windows".into());
     }
     Ok(Snapshot::ok(ID, NAME, plan_from_doc(doc, weekly_limit), metrics))
+}
+
+/// Official ratio schema: finite numbers or numeric strings in [0, 1].
+/// Reject invalid readings rather than turn them into an unused/full quota.
+fn ratio_progress(label: &str, node: &Value, period_ms: Option<i64>) -> Option<Metric> {
+    let ratio = json_f64(node.get("used_ratio"))?;
+    if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+        return None;
+    }
+    let resets_at = node.get("reset_time").and_then(Value::as_str).and_then(parse_iso_ms);
+    Some(Metric::progress(label, ratio * 100.0, None).with_reset(resets_at, period_ms))
 }
 
 fn progress_from(label: &str, node: &Value, period_ms: i64) -> Option<Metric> {
@@ -536,6 +572,128 @@ mod tests {
 
     fn labels(metrics: &[Metric]) -> Vec<&str> {
         metrics.iter().map(|m| m.label.as_str()).collect()
+    }
+
+    // Wire keys are documented by MoonshotAI/kimi-code's
+    // packages/oauth/src/managed-usage.ts; these are synthetic fixtures.
+    #[test]
+    fn ratio_session_then_monthly_with_no_invented_month_duration() {
+        let snap = parse_snapshot(&json!({"usages": {
+            "limit_month_code": {"used_ratio": 0.25},
+            "limit_month_total": {"used_ratio": 0.4, "reset_time": "2026-10-01T00:00:00Z"},
+            "limit_5h": {"used_ratio": "0.0056", "reset_time": "2026-09-11T18:00:00Z"}
+        }})).unwrap();
+        assert_eq!(labels(&snap.metrics), ["Session", "Monthly"]);
+        assert!((snap.metrics[0].used_percent.unwrap() - 0.56).abs() < 1e-9);
+        assert_eq!(snap.metrics[0].period_ms, Some(5 * HOUR_MS));
+        let monthly = &snap.metrics[1];
+        assert_eq!(monthly.used_percent, Some(40.0));
+        assert_eq!(monthly.resets_at, parse_iso_ms("2026-10-01T00:00:00Z"));
+        assert_eq!(monthly.period_ms, None);
+        assert_eq!(monthly.detail, None);
+        assert_eq!(monthly.value, None);
+    }
+
+    #[test]
+    fn ratio_pools_have_stable_order_and_keep_explicit_weekly() {
+        let snap = parse_snapshot(&json!({"usages": {
+            "limit_month_total": {"used_ratio": 0.4},
+            "limit_7d": {"used_ratio": 0.2},
+            "limit_5h": {"used_ratio": 0.3}
+        }})).unwrap();
+        assert_eq!(labels(&snap.metrics), ["Session", "Weekly", "Monthly"]);
+        assert_eq!(snap.metrics[1].used_percent, Some(20.0));
+        assert_eq!(snap.metrics[1].period_ms, Some(7 * DAY_MS));
+    }
+
+    #[test]
+    fn ratio_legacy_plan_keeps_session_and_weekly_without_monthly() {
+        let snap = parse_snapshot(&json!({"usages": {
+            "limit_7d": {"used_ratio": "0.2", "reset_time": "2026-09-17T00:00:00Z"},
+            "limit_5h": {"used_ratio": 0.3}
+        }})).unwrap();
+        assert_eq!(labels(&snap.metrics), ["Session", "Weekly"]);
+        assert_eq!(snap.metrics[1].used_percent, Some(20.0));
+        assert_eq!(snap.metrics[1].resets_at, parse_iso_ms("2026-09-17T00:00:00Z"));
+    }
+
+    #[test]
+    fn ratio_format_wins_without_relabeling_legacy_usage_as_weekly() {
+        let snap = parse_snapshot(&json!({
+            "usages": {"limit_5h": {"used_ratio": 0.3}, "limit_month_total": {"used_ratio": 0.4}},
+            "usage": {"limit": 2048, "used": 10},
+            "limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                        "detail": {"limit": 100, "used": 99}}]
+        })).unwrap();
+        assert_eq!(labels(&snap.metrics), ["Session", "Monthly"]);
+        assert_eq!(snap.metrics[0].used_percent, Some(30.0));
+        assert_eq!(snap.plan, None);
+    }
+
+    #[test]
+    fn absent_ratio_session_can_use_explicit_legacy_session() {
+        let snap = parse_snapshot(&json!({
+            "usages": {"limit_month_total": {"used_ratio": 0.4}},
+            "limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                        "detail": {"limit": 100, "used": 15}}]
+        })).unwrap();
+        assert_eq!(labels(&snap.metrics), ["Session", "Monthly"]);
+        assert_eq!(snap.metrics[0].used_percent, Some(15.0));
+    }
+
+    #[test]
+    fn ratio_zero_and_one_are_valid_without_reset() {
+        for (ratio, percent) in [(json!(0), 0.0), (json!("1"), 100.0)] {
+            let snap = parse_snapshot(&json!({"usages": {"limit_month_total": {"used_ratio": ratio}}})).unwrap();
+            assert_eq!(labels(&snap.metrics), ["Monthly"]);
+            assert_eq!(snap.metrics[0].used_percent, Some(percent));
+            assert_eq!(snap.metrics[0].resets_at, None);
+            assert_eq!(snap.metrics[0].period_ms, None);
+        }
+    }
+
+    #[test]
+    fn malformed_ratios_are_not_zero_or_legacy_weekly() {
+        for ratio in [json!(null), json!(true), json!(""), json!(" "), json!("NaN"),
+                      json!("inf"), json!("40%"), json!(-0.1), json!(1.1), json!({})] {
+            assert!(parse_snapshot(&json!({
+                "usages": {"limit_month_total": {"used_ratio": ratio}},
+                "usage": {"limit": 100, "used": 0}
+            })).is_err(), "invalid ratio: {ratio}");
+        }
+    }
+
+    #[test]
+    fn unknown_and_component_pools_do_not_invent_a_quota() {
+        for usages in [json!({}), json!(null), json!({"limit_month_code": {"used_ratio": 0.2}}),
+                       json!({"limit_future": {"used_ratio": 0.1}}),
+                       json!({"limit_month_total": {"reset_time": "2026-10-01T00:00:00Z"}})] {
+            assert!(parse_snapshot(&json!({"usages": usages})).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_ratio_pool_does_not_hide_valid_sibling_or_fall_back() {
+        let snap = parse_snapshot(&json!({
+            "usages": {"limit_5h": {"used_ratio": "bad"}, "limit_month_total": {"used_ratio": 0.4}},
+            "limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                        "detail": {"limit": 100, "used": 15}}]
+        })).unwrap();
+        assert_eq!(labels(&snap.metrics), ["Monthly"]);
+    }
+
+    #[test]
+    fn ratio_reset_requires_valid_rfc3339_and_preserves_offset() {
+        for reset in [json!(null), json!(42), json!(""), json!("not a date")] {
+            let snap = parse_snapshot(&json!({"usages": {"limit_month_total": {
+                "used_ratio": 0.4, "reset_time": reset
+            }}})).unwrap();
+            assert_eq!(snap.metrics[0].resets_at, None);
+        }
+        let snap = parse_snapshot(&json!({"usages": {"limit_month_total": {
+            "used_ratio": 0.4, "reset_time": "2026-10-01T08:00:00+08:00"
+        }}})).unwrap();
+        assert_eq!(snap.metrics[0].resets_at, parse_iso_ms("2026-10-01T00:00:00Z"));
     }
 
     #[test]

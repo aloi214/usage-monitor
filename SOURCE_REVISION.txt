@@ -1,12 +1,12 @@
-Pane Private — per-provider automatic quota refresh, 2026-10-07
-Verified combined product code: ce8dfa96f098cf425b9c339484a372004b1b477c
-Verified backend code: 867db99f7395d1d7c14283515a4a96ac4b3fb048
-Previous source delivery: 709d5da9f8873b12e71cde37b0df85f626069ba4
-Upstream base: a55578c7b10c2ef1d136dc4decaefcaa0fb7a15e
+Pane Private / usage-monitor — Zhipu and Kimi quota-window fixes, 2026-10-08
+GitHub base: aloi214/usage-monitor main at 9fa6f657c3c3c67968529b24413f4bf68bc4722c
+Verified local product revision: 588298e22d7b775e2c26d209a80ac5c0f9ecfa90
+The local verification revision identifies the tested source, not a promised GitHub commit ID. Publication verifies file/tree equality.
+Upstream source base: a55578c7b10c2ef1d136dc4decaefcaa0fb7a15e
 
-Adds independent automatic quota refresh preferences for 22 remote providers; all 23 platforms remain supported.
-Claude and CommandCode default to manual, other remote providers retain their prior automatic defaults. Permissions remain independently required.
-Manual card/global refresh remains available. Cursor remote CSV obeys its automatic setting; ordinary local log scanning and manual pricing sync remain independent.
-Start with README.zh-CN.md, docs/provider-auto-refresh.md, and docs/provider-auto-refresh-validation.md.
-Source code only, not an installer. Native Windows/WebView2, real-account compatibility, installation and package size remain unverified.
-MANIFEST.sha256 lists every packaged source file except the manifest itself.
+Zhipu/Z.ai keeps independent five-hour and weekly token quota windows and reset times.
+Kimi supports official ratio-based Session/Weekly/shared Monthly pools and legacy responses without inventing monthly duration or absolute token counts.
+Saved layout, hidden/on-demand, star and pin selections migrate to observed quota windows.
+Read docs/quota-window-fix.md for behavior, sources, verification and limits.
+Source code only. Native Windows/WebView2, real account responses and installation remain unverified for this revision.
+MANIFEST.sha256 lists every tracked source file except itself.
