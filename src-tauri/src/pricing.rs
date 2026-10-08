@@ -1,0 +1,2400 @@
+//! Live model pricing — a port of the Mac app's ModelPricingStore.
+//!
+//! Three sources, most-authoritative first at lookup time:
+//!   1. Robin's pricing supplement (Cursor-native models, fast multipliers,
+//!      alias regexes mapping log slugs to canonical keys) — updates land
+//!      without an app release.
+//!   2. LiteLLM's model_prices catalog (USD per token — converted here).
+//!   3. models.dev (USD per million; exact-match only — fuzzy-matching a
+//!      reseller rate would fabricate dollars).
+//!
+//! Catalogs load locally from one validated atomic bundle. Only the explicit
+//! manual synchronization command downloads the fixed public sources.
+//! Missing models remain unpriced; baked-in cards remain available offline.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+use serde_json::Value;
+
+use crate::providers;
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Price {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    /// Rates for requests whose prompt crosses 200k tokens — 1M-context
+    /// models bill the whole request at a higher tier. None = no tier.
+    pub input_200k: Option<f64>,
+    pub output_200k: Option<f64>,
+    pub cache_read_200k: Option<f64>,
+    pub cache_write_200k: Option<f64>,
+    /// Explicit 1-hour cache-write rates; absent, 1h writes bill at
+    /// twice the (tier-selected) input rate.
+    pub cache_write_1h: Option<f64>,
+    pub cache_write_1h_200k: Option<f64>,
+}
+
+impl Price {
+    /// A price with no long-context tier and no explicit 1h rate — what
+    /// models.dev, the supplement, and the static fallbacks provide.
+    pub fn flat(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Self {
+        Price {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            input_200k: None,
+            output_200k: None,
+            cache_read_200k: None,
+            cache_write_200k: None,
+            cache_write_1h: None,
+            cache_write_1h_200k: None,
+        }
+    }
+}
+
+/// One request's token counts, cache writes split by lifetime.
+pub struct Usage {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write_5m: f64,
+    pub cache_write_1h: f64,
+}
+
+/// Dollar cost of one request. Vendors bill the *whole* request (output
+/// included) at the >200k tier once the prompt — everything except output —
+/// crosses 200k tokens; aggregated sources (Cursor's CSV) opt out because
+/// their rows don't preserve request boundaries. 1-hour cache writes bill
+/// at twice the tier-selected input rate unless the catalog carries an
+/// explicit rate.
+pub fn request_cost(p: &Price, u: &Usage, apply_long_context: bool) -> f64 {
+    request_cost_at(p, u, if apply_long_context { 200_000.0 } else { f64::INFINITY })
+}
+
+/// Like `request_cost`, with an explicit long-context threshold — the tier
+/// boundary is vendor-specific (Anthropic switches at 200k prompt tokens,
+/// OpenAI's Codex models at 272k).
+pub fn request_cost_at(p: &Price, u: &Usage, threshold: f64) -> f64 {
+    let prompt = u.input + u.cache_read + u.cache_write_5m + u.cache_write_1h;
+    let long = prompt > threshold;
+    let pick = |base: f64, above: Option<f64>| if long { above.unwrap_or(base) } else { base };
+    let input = pick(p.input, p.input_200k);
+    let w1h = if long {
+        p.cache_write_1h_200k
+            .or(p.input_200k.map(|i| i * 2.0))
+            .unwrap_or_else(|| p.cache_write_1h.unwrap_or(p.input * 2.0))
+    } else {
+        p.cache_write_1h.unwrap_or(p.input * 2.0)
+    };
+    (u.input * input
+        + u.output * pick(p.output, p.output_200k)
+        + u.cache_read * pick(p.cache_read, p.cache_read_200k)
+        + u.cache_write_5m * pick(p.cache_write, p.cache_write_200k)
+        + u.cache_write_1h * w1h)
+        / 1e6
+}
+
+/// 2026-09-10T04:00Z — DeepSeek's V4.1 Flash card changeover: before it
+/// the model billed at AihubMix's flat launch card, and no peak windows
+/// existed at all.
+pub const V41_FLASH_CHANGEOVER_MS: i64 = 1_789_012_800_000;
+
+/// The V4.1 Flash SKU under any log spelling: gateway prefixes and Pi's
+/// routing tag peeled, dated snapshot tails and effort suffixes stripped
+/// (the same trims resolve() does, so every name that prices at this
+/// card also peaks at it).
+fn v41_flash_slug(model: &str) -> bool {
+    let mut bare = model.rsplit(['/', '\u{1}']).next().unwrap_or(model);
+    for suf in ["-xhigh", "-light", "-low", "-medium", "-high", "-max", "-ultra"] {
+        if let Some(next) = bare.strip_suffix(suf) {
+            bare = next;
+        }
+    }
+    if let Some((head, tail)) = bare.rsplit_once('-') {
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            bare = head;
+        }
+    }
+    matches!(bare, "deepseek-v4.1-flash" | "deepseek-v4-1-flash")
+}
+
+/// DeepSeek V4.1 Flash peak hours bill at 2× the whole card (official
+/// schedule effective 2026-09-10, mirrored by AihubMix): 01:00–04:00 and
+/// 06:00–10:00 UTC on weekdays; weekends are always off-peak. (Public
+/// holidays are off-peak too, but we can't detect those — a handful of
+/// days a year read as peak.) Every other model: 1.0.
+pub fn peak_multiplier(model: &str, ts_ms: i64) -> f64 {
+    use chrono::{Datelike, Timelike};
+    if ts_ms < V41_FLASH_CHANGEOVER_MS || !v41_flash_slug(model) {
+        return 1.0;
+    }
+    let Some(ts) = chrono::DateTime::from_timestamp_millis(ts_ms) else { return 1.0 };
+    if ts.weekday().num_days_from_monday() > 4 {
+        return 1.0; // weekend
+    }
+    let mins = ts.num_seconds_from_midnight() / 60;
+    if (60..240).contains(&mins) || (360..600).contains(&mins) { 2.0 } else { 1.0 }
+}
+
+/// Whether peak_multiplier can ever return 2× for this model.
+pub fn peak_windowed(model: &str) -> bool {
+    v41_flash_slug(model)
+}
+
+/// The pre-changeover card (AihubMix's flat launch pricing) for V4.1
+/// Flash events before 2026-09-10T04:00Z. None for other models or
+/// later events — those use the resolved card as-is.
+pub fn v41_flash_legacy_card(model: &str, ts_ms: i64) -> Option<Price> {
+    if ts_ms >= V41_FLASH_CHANGEOVER_MS || !v41_flash_slug(model) {
+        return None;
+    }
+    Some(Price::flat(0.142, 0.284, 0.0284, 0.142))
+}
+
+/// Milliseconds of [start_ms, end_ms) inside V4.1 Flash peak windows —
+/// Hermes rows aggregate whole sessions, so a boundary-crossing session
+/// splits its cost by this share. The changeover clamps the interval:
+/// peak windows didn't exist before it.
+pub fn peak_overlap_ms(start_ms: i64, end_ms: i64) -> i64 {
+    use chrono::Datelike;
+    let start_ms = start_ms.max(V41_FLASH_CHANGEOVER_MS);
+    if end_ms <= start_ms {
+        return 0;
+    }
+    let mut total = 0;
+    let mut day = start_ms - start_ms.rem_euclid(86_400_000);
+    // Sessions don't span weeks; the cap just bounds a corrupt interval.
+    for _ in 0..45 {
+        if day >= end_ms {
+            break;
+        }
+        let Some(ts) = chrono::DateTime::from_timestamp_millis(day) else { break };
+        if ts.weekday().num_days_from_monday() <= 4 {
+            for (s, e) in [(60_i64, 240), (360, 600)] {
+                let window_start = day + s * 60_000;
+                let window_end = day + e * 60_000;
+                total += (end_ms.min(window_end) - start_ms.max(window_start)).max(0);
+            }
+        }
+        day += 86_400_000;
+    }
+    total
+}
+
+/// The supplement's fast multiplier for a model, 1.0 when none is
+/// published — a fast-flagged request without data bills at standard
+/// rates rather than a guessed premium (Mac behavior).
+pub fn fast_multiplier(model: &str) -> f64 {
+    let mut s = store().lock().unwrap();
+    if !s.loaded_from_disk {
+        load_from_disk(&mut s);
+    }
+    s.fast_multipliers.get(model).copied().unwrap_or(1.0)
+}
+
+const SOURCES: [(&str, &str); 3] = [
+    (
+        "litellm",
+        "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+    ),
+    ("modelsdev", "https://models.dev/api.json"),
+    (
+        "supplement",
+        "https://robinebers.github.io/openusage/pricing_supplement.json",
+    ),
+];
+/// The catalogs are third-party feeds; a compromised one must not be able
+/// to fill memory (and then the disk cache) with an arbitrarily large
+/// response. Largest legitimate source today is LiteLLM at ~3 MB — 32 MB
+/// leaves room to grow while still bounding the damage.
+const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct Store {
+    litellm: HashMap<String, Price>,
+    modelsdev: HashMap<String, Price>,
+    supplement: HashMap<String, Price>,
+    fast_multipliers: HashMap<String, f64>,
+    alias_rules: Vec<(regex::Regex, String)>,
+    memo: HashMap<String, Option<Price>>,
+    loaded_from_disk: bool,
+    bundle: Option<CatalogBundle>,
+}
+
+fn store() -> &'static Mutex<Store> {
+    static S: OnceLock<Mutex<Store>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Changed only after whole-bundle publication, under the collection lock.
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn generation() -> u64 {
+    GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bump whenever the baked-in pricing behavior changes (stale-catalog
+/// corrections, builtin fallbacks, long-context tables): the persisted
+/// spend cache holds pre-priced totals, and only the catalog *files* are
+/// fingerprinted below — an app update that reprices the same files would
+/// otherwise leave history at the old dollars until upstream happens to
+/// rewrite a catalog.
+const CORRECTIONS_REV: u32 = 16; // 16: StepFun builtins (step-5-preview, audio, CN-only models)
+
+/// The corrections revision on its own — the spend cache treats a changed
+/// revision as a hard discard (the *code* that prices changed), while a
+/// changed catalog file only re-prices files whose recorded price probes
+/// no longer replay identically.
+///
+/// Bump this whenever baked rates *or* spend.rs's own pricing tables change
+/// (`claude_price`, `codex_price`, `grok_price`, `codex_long_context`,
+/// `codex_priority_multiplier` hardcoded arms, `codex_no_cache_discount`,
+/// `request_cost` thresholds). Probes only witness catalog lookups — they
+/// cannot vouch for that code. A forgotten bump used to get papered over
+/// within a day by catalog-stamp churn; it now leaves stale dollars until
+/// the next bump.
+///
+/// Parser-logic changes (`claude_line`, `codex_line`, `pi_line`, token
+/// field spellings, dedup rules) bump `PERSIST_VERSION` in spend.rs
+/// instead — probes cannot see those either.
+pub fn corrections_rev() -> u32 {
+    CORRECTIONS_REV
+}
+/// The live OpenUsage supplement is ~105 alias rules (Daybreak, Cursor
+/// Router prose names, GPT-5.3–5.6 effort slugs). 64 silently dropped
+/// everything after `gpt-5.2`. Per-rule caps below still bound memory.
+const MAX_ALIAS_RULES: usize = 256;
+/// Bounds for what the supplement feed may claim — it is trusted by URL
+/// alone yet outranks both catalogs in resolve(). No real model prices
+/// above ~$600/M, and a fast tier outside 1×–10× is a corrupt feed, not
+/// a SKU. Entries outside the bounds are dropped, not clamped.
+const MAX_SUPPLEMENT_PRICE: f64 = 10_000.0;
+const MAX_FAST_MULTIPLIER: f64 = 10.0;
+
+/// Content hash of the effective, published catalog documents plus the baked
+/// corrections revision. Revalidation/ETag/time changes alone do not alter it.
+/// Persisted entries replay their price probes when this stamp changes.
+pub fn catalog_stamp() -> String {
+    status().catalog_stamp
+}
+
+fn dir() -> PathBuf {
+    providers::config_dir().join("pricing")
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+// ---------------------------------------------------------------------------
+// Parsing (each source's shape → HashMap<model, Price> per million tokens)
+// ---------------------------------------------------------------------------
+
+fn parse_litellm(doc: &Value) -> HashMap<String, Price> {
+    let mut out = HashMap::new();
+    let Some(obj) = doc.as_object() else { return out };
+    for (model, entry) in obj {
+        if model == "sample_spec" { continue; }
+        let per_tok = |key: &str| entry.get(key).and_then(Value::as_f64);
+        let (Some(input), Some(output)) =
+            (per_tok("input_cost_per_token"), per_tok("output_cost_per_token"))
+        else {
+            continue;
+        };
+        let per_m = |key: &str| per_tok(key).map(|v| v * 1e6);
+        out.insert(
+            model.clone(),
+            Price {
+                input: input * 1e6,
+                output: output * 1e6,
+                cache_read: per_m("cache_read_input_token_cost").unwrap_or(input * 1e6),
+                cache_write: per_m("cache_creation_input_token_cost").unwrap_or(input * 1e6),
+                input_200k: per_m("input_cost_per_token_above_200k_tokens"),
+                output_200k: per_m("output_cost_per_token_above_200k_tokens"),
+                cache_read_200k: per_m("cache_read_input_token_cost_above_200k_tokens"),
+                cache_write_200k: per_m("cache_creation_input_token_cost_above_200k_tokens"),
+                cache_write_1h: per_m("cache_creation_input_token_cost_above_1hr"),
+                cache_write_1h_200k: per_m("cache_creation_input_token_cost_above_1hr_above_200k_tokens"),
+            },
+        );
+    }
+    out
+}
+
+fn parse_modelsdev(doc: &Value) -> HashMap<String, Price> {
+    // models.dev repeats ids across resellers with varying completeness —
+    // the entry documenting the most cache fields wins (ties: first seen),
+    // so a reseller stub with no cache rates can't default a $0.30 cache
+    // hit to the $3.00 input price.
+    let mut out: HashMap<String, (Price, u8)> = HashMap::new();
+    let Some(providers) = doc.as_object() else { return HashMap::new() };
+    for provider in providers.values() {
+        let Some(models) = provider.get("models").and_then(Value::as_object) else { continue };
+        for (id, m) in models {
+            let Some(cost) = m.get("cost") else { continue };
+            let get = |key: &str| cost.get(key).and_then(Value::as_f64);
+            let (Some(input), Some(output)) = (get("input"), get("output")) else { continue };
+            let score =
+                get("cache_read").is_some() as u8 + get("cache_write").is_some() as u8;
+            let price = Price::flat(
+                input,
+                output,
+                get("cache_read").unwrap_or(input),
+                get("cache_write").unwrap_or(input),
+            );
+            match out.entry(id.clone()) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((price, score));
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) if score > e.get().1 => {
+                    e.insert((price, score));
+                }
+                _ => {}
+            }
+        }
+    }
+    out.into_iter().map(|(k, (p, _))| (k, p)).collect()
+}
+
+fn apply_supplement(store: &mut Store, doc: &Value) {
+    store.supplement.clear();
+    store.fast_multipliers.clear();
+    store.alias_rules.clear();
+    // The feed is trusted by URL alone yet outranks both catalogs in
+    // resolve(), so every value it hands us is range-checked on the way
+    // in; drops are counted and reported once at the end.
+    let mut dropped = 0usize;
+    if let Some(pricing) = doc.get("pricing").and_then(Value::as_object) {
+        for (model, entry) in pricing {
+            let get = |key: &str| entry.get(key).and_then(Value::as_f64);
+            let (Some(input), Some(output)) =
+                (get("input_per_million"), get("output_per_million"))
+            else {
+                continue;
+            };
+            let cache_read = get("cache_read_per_million").unwrap_or(input);
+            let cache_write = get("cache_write_per_million").unwrap_or(input);
+            let plausible = |v: f64| v.is_finite() && (0.0..=MAX_SUPPLEMENT_PRICE).contains(&v);
+            if ![input, output, cache_read, cache_write].into_iter().all(plausible) {
+                dropped += 1;
+                continue;
+            }
+            store.supplement.insert(
+                model.clone(),
+                Price::flat(input, output, cache_read, cache_write),
+            );
+        }
+    }
+    correct_stale_supplement(&mut store.supplement);
+    if let Some(mults) = doc.get("fast_multipliers").and_then(Value::as_object) {
+        for (model, v) in mults {
+            if let Some(m) = v.as_f64() {
+                if m.is_finite() && (1.0..=MAX_FAST_MULTIPLIER).contains(&m) {
+                    store.fast_multipliers.insert(model.clone(), m);
+                } else {
+                    dropped += 1;
+                }
+            }
+        }
+    }
+    // 2026-07-31: OpenAI cut gpt-5.6-terra/-luna prices and both public
+    // catalogs (and the supplement, which outranks them here) still carry
+    // launch pricing. Correct ONLY the exact known-stale values — a
+    // self-retiring override: the moment the supplement publishes any new
+    // number for these models, its data wins again untouched. Remove this
+    // whole function once upstream catches up.
+    fn correct_stale_supplement(supplement: &mut HashMap<String, Price>) {
+        let corrections: [(&str, f64, Price); 2] = [
+            ("gpt-5.6-terra", 2.5, Price::flat(2.0, 12.0, 0.2, 2.5)),
+            ("gpt-5.6-luna", 1.0, Price::flat(0.2, 1.2, 0.02, 0.25)),
+        ];
+        for (model, stale_input, corrected) in corrections {
+            if let Some(p) = supplement.get_mut(model) {
+                if (p.input - stale_input).abs() < 1e-9 {
+                    *p = corrected;
+                }
+            }
+        }
+    }
+
+    // The supplement is fetched from a third-party URL, so cap what it can
+    // feed us: at most MAX_ALIAS_RULES of at most 256 chars each, compiled
+    // with a bounded size, with plain-slug targets. (Rust's regex engine is
+    // linear-time by design, so ReDoS-style backtracking blowups aren't
+    // possible; the caps bound memory and compile cost.)
+    if let Some(rules) = doc.get("alias_rules").and_then(Value::as_array) {
+        for rule in rules.iter().take(MAX_ALIAS_RULES) {
+            let (Some(pattern), Some(canonical)) = (
+                rule.get("pattern").and_then(Value::as_str),
+                rule.get("canonical").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            // Targets become model names inside resolve() — plain ASCII
+            // slugs only, so a rule can't smuggle control characters,
+            // spaces, or unicode lookalikes into lookups.
+            if pattern.len() > 256
+                || canonical.len() > 128
+                || canonical.is_empty()
+                || !canonical.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'/' | b'_' | b'-'))
+            {
+                dropped += 1;
+                continue;
+            }
+            if let Ok(re) = regex::RegexBuilder::new(pattern)
+                .size_limit(1 << 20)
+                .build()
+            {
+                store.alias_rules.push((re, canonical.to_string()));
+            }
+        }
+    }
+    if dropped > 0 {
+        eprintln!("[pane] pricing: supplement dropped {dropped} out-of-range entries");
+    }
+}
+
+fn ingest(store: &mut Store, source: &str, doc: &Value) {
+    match source {
+        "litellm" => store.litellm = parse_litellm(doc),
+        "modelsdev" => store.modelsdev = parse_modelsdev(doc),
+        "supplement" => apply_supplement(store, doc),
+        _ => {}
+    }
+    store.memo.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Atomic local bundle and explicit manual synchronization
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PricingSyncResult {
+    pub last_success_ms: i64,
+    pub catalog_stamp: String,
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Catalog {
+    etag: String,
+    document: Value,
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogBundle {
+    version: u32,
+    last_success_ms: i64,
+    catalogs: std::collections::BTreeMap<String, Catalog>,
+}
+fn bundle_stamp(bundle: &CatalogBundle) -> String {
+    use sha2::{Digest, Sha256};
+    // Success time and ETags aren't pricing inputs. A 304 does not reparse logs.
+    let docs: std::collections::BTreeMap<_, _> = bundle
+        .catalogs
+        .iter()
+        .map(|(k, v)| (k, &v.document))
+        .collect();
+    format!(
+        "{:x}|corrections:{CORRECTIONS_REV}",
+        Sha256::digest(serde_json::to_vec(&docs).unwrap())
+    )
+}
+/// Validate advertised rates before parsing, selection, or fallback can omit
+/// them. Non-price metadata and models without rates remain allowed; explicit
+/// numeric zero is a real price, while a malformed advertised rate is an error.
+fn validate_advertised_rates(source: &str, doc: &Value) -> Result<(), String> {
+    fn fields(source: &str, entry: &Value, keys: &[&str], scale: f64) -> Result<(), String> {
+        for key in keys {
+            if let Some(value) = entry.get(*key) {
+                if !value.as_f64().is_some_and(|v| {
+                    v.is_finite() && (0.0..=MAX_SUPPLEMENT_PRICE).contains(&(v * scale))
+                }) {
+                    return Err(format!("Invalid {source} price field: {key}"));
+                }
+            }
+        }
+        Ok(())
+    }
+    let object = doc
+        .as_object()
+        .ok_or_else(|| format!("Invalid {source} catalog format"))?;
+    match source {
+        "litellm" => {
+            for (model, entry) in object {
+                // LiteLLM includes a descriptive field/type schema here.
+                if model == "sample_spec" {
+                    continue;
+                }
+                fields(
+                    source,
+                    entry,
+                    &[
+                        "input_cost_per_token",
+                        "output_cost_per_token",
+                        "cache_read_input_token_cost",
+                        "cache_creation_input_token_cost",
+                        "input_cost_per_token_above_200k_tokens",
+                        "output_cost_per_token_above_200k_tokens",
+                        "cache_read_input_token_cost_above_200k_tokens",
+                        "cache_creation_input_token_cost_above_200k_tokens",
+                        "cache_creation_input_token_cost_above_1hr",
+                        "cache_creation_input_token_cost_above_1hr_above_200k_tokens",
+                    ],
+                    1e6,
+                )?;
+            }
+        }
+        "modelsdev" => {
+            for provider in object.values() {
+                let Some(models) = provider.get("models") else {
+                    continue;
+                };
+                let models = models.as_object().ok_or("Invalid modelsdev models map")?;
+                for model in models.values() {
+                    if let Some(cost) = model.get("cost") {
+                        if !cost.is_object() {
+                            return Err("Invalid modelsdev cost object".into());
+                        }
+                        fields(
+                            source,
+                            cost,
+                            &["input", "output", "cache_read", "cache_write"],
+                            1.,
+                        )?;
+                    }
+                }
+            }
+        }
+        "supplement" => {
+            let prices = doc
+                .get("pricing")
+                .and_then(Value::as_object)
+                .ok_or("Invalid supplement pricing map")?;
+            for entry in prices.values() {
+                if !entry.is_object() {
+                    return Err("Invalid supplement price entry".into());
+                }
+                fields(
+                    source,
+                    entry,
+                    &[
+                        "input_per_million",
+                        "output_per_million",
+                        "cache_read_per_million",
+                        "cache_write_per_million",
+                    ],
+                    1.,
+                )?;
+            }
+            if let Some(multipliers) = doc.get("fast_multipliers") {
+                for value in multipliers
+                    .as_object()
+                    .ok_or("Invalid supplement multipliers map")?
+                    .values()
+                {
+                    if !value
+                        .as_f64()
+                        .is_some_and(|v| v.is_finite() && (1.0..=MAX_FAST_MULTIPLIER).contains(&v))
+                    {
+                        return Err("Invalid supplement fast multiplier".into());
+                    }
+                }
+            }
+        }
+        _ => return Err("Unknown catalog source".into()),
+    }
+    Ok(())
+}
+
+fn validate_bundle(bundle: &CatalogBundle) -> Result<Store, String> {
+    if bundle.version != 1 || bundle.last_success_ms <= 0 || bundle.catalogs.len() != SOURCES.len()
+    {
+        return Err("Invalid catalog bundle".into());
+    }
+    let mut next = Store::default();
+    for (source, _) in SOURCES {
+        let cat = bundle
+            .catalogs
+            .get(source)
+            .ok_or("Incomplete catalog bundle")?;
+        if cat.etag.len() > 4096 || cat.etag.contains(['\r', '\n']) {
+            return Err("Invalid catalog ETag".into());
+        }
+        if !cat.document.is_object() {
+            return Err(format!("Invalid {source} catalog format"));
+        }
+        validate_advertised_rates(source, &cat.document)?;
+        ingest(&mut next, source, &cat.document);
+        let prices = match source {
+            "litellm" => &next.litellm,
+            "modelsdev" => &next.modelsdev,
+            _ => &next.supplement,
+        };
+        if prices.is_empty() || prices.values().any(|p| !valid_price(p)) {
+            return Err(format!("Invalid or empty {source} price catalog"));
+        }
+    }
+    next.loaded_from_disk = true;
+    next.bundle = Some(bundle.clone());
+    Ok(next)
+}
+fn valid_price(p: &Price) -> bool {
+    [
+        Some(p.input),
+        Some(p.output),
+        Some(p.cache_read),
+        Some(p.cache_write),
+        p.input_200k,
+        p.output_200k,
+        p.cache_read_200k,
+        p.cache_write_200k,
+        p.cache_write_1h,
+        p.cache_write_1h_200k,
+    ]
+    .into_iter()
+    .flatten()
+    .all(|v| v.is_finite() && (0.0..=MAX_SUPPLEMENT_PRICE).contains(&v))
+}
+fn read_bundle(path: &std::path::Path) -> Option<CatalogBundle> {
+    use std::io::Read;
+    let mut raw = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take((MAX_CATALOG_BYTES * 3 + 65536 + 1) as u64)
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() > MAX_CATALOG_BYTES * 3 + 65536 {
+        return None;
+    }
+    let bundle = serde_json::from_slice(&raw).ok()?;
+    validate_bundle(&bundle).ok()?;
+    Some(bundle)
+}
+
+fn load_from_disk(s: &mut Store) {
+    // Legacy per-source files had no transaction marker and may be a partial
+    // refresh. Never assemble them into an allegedly validated catalog set.
+    if let Some(bundle) = read_bundle(&dir().join("catalogs.json")) {
+        if let Ok(next) = validate_bundle(&bundle) {
+            *s = next;
+        }
+    }
+    s.loaded_from_disk = true;
+}
+pub fn status() -> PricingSyncResult {
+    let mut s = store().lock().unwrap();
+    if !s.loaded_from_disk {
+        load_from_disk(&mut s);
+    }
+    PricingSyncResult {
+        last_success_ms: s.bundle.as_ref().map(|b| b.last_success_ms).unwrap_or(0),
+        catalog_stamp: s
+            .bundle
+            .as_ref()
+            .map(bundle_stamp)
+            .unwrap_or_else(|| format!("builtin|corrections:{CORRECTIONS_REV}")),
+    }
+}
+
+enum Download {
+    NotModified,
+    Body(String, String),
+}
+async fn download(source: &str, etag: &str) -> Result<Download, String> {
+    let url = SOURCES
+        .iter()
+        .find(|(s, _)| *s == source)
+        .ok_or("Unknown price source")?
+        .1;
+    let mut resp = crate::network_transport::public_price_request(url, providers::proxy_url())
+        .etag(etag)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let code = resp.status().as_u16();
+    if code == 304 {
+        return Ok(Download::NotModified);
+    }
+    if !(200..300).contains(&code) {
+        return Err(format!("{source}: HTTP {code}"));
+    }
+    let etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_CATALOG_BYTES as u64)
+    {
+        return Err(format!("{source}: catalog exceeds size limit"));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if bytes.len() + chunk.len() > MAX_CATALOG_BYTES {
+            return Err(format!("{source}: catalog exceeds size limit"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Download::Body(
+        String::from_utf8(bytes).map_err(|_| format!("{source}: invalid UTF-8"))?,
+        etag,
+    ))
+}
+async fn prepare_bundle<F, Fut>(
+    old: Option<&CatalogBundle>,
+    time: i64,
+    mut fetch: F,
+) -> Result<CatalogBundle, String>
+where
+    F: FnMut(&'static str, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Download, String>>,
+{
+    let mut catalogs = std::collections::BTreeMap::new();
+    for (source, _) in SOURCES {
+        let previous = old.and_then(|b| b.catalogs.get(source));
+        let etag = previous.map(|c| c.etag.clone()).unwrap_or_default();
+        let catalog = match fetch(source, etag).await? {
+            Download::NotModified => previous
+                .cloned()
+                .ok_or_else(|| format!("{source}: 304 without a saved catalog"))?,
+            Download::Body(raw, etag) => {
+                if raw.len() > MAX_CATALOG_BYTES {
+                    return Err(format!("{source}: catalog exceeds size limit"));
+                }
+                Catalog {
+                    etag,
+                    document: serde_json::from_str(&raw)
+                        .map_err(|_| format!("{source}: invalid JSON"))?,
+                }
+            }
+        };
+        catalogs.insert(source.to_string(), catalog);
+    }
+    let bundle = CatalogBundle {
+        version: 1,
+        last_success_ms: time,
+        catalogs,
+    };
+    validate_bundle(&bundle)?;
+    Ok(bundle)
+}
+
+#[derive(Default)]
+struct SyncCoordinator {
+    attempt: std::sync::atomic::AtomicU64,
+    result: tokio::sync::Mutex<Option<Result<PricingSyncResult, String>>>,
+}
+struct SyncAttempt<'a> {
+    result: &'a mut Option<Result<PricingSyncResult, String>>,
+    attempt: &'a std::sync::atomic::AtomicU64,
+}
+impl Drop for SyncAttempt<'_> {
+    fn drop(&mut self) {
+        if self.result.is_none() {
+            *self.result = Some(Err("Price synchronization cancelled".into()));
+        }
+        self.attempt
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl SyncCoordinator {
+    async fn run<F, Fut>(&self, work: F) -> Result<PricingSyncResult, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<PricingSyncResult, String>>,
+    {
+        let observed = self.attempt.load(std::sync::atomic::Ordering::SeqCst);
+        let mut result = self.result.lock().await;
+        if self.attempt.load(std::sync::atomic::Ordering::SeqCst) != observed {
+            return result
+                .clone()
+                .unwrap_or_else(|| Err("Price synchronization cancelled".into()));
+        }
+        *result = None;
+        let attempt = SyncAttempt {
+            result: &mut result,
+            attempt: &self.attempt,
+        };
+        let next = work().await;
+        *attempt.result = Some(next.clone());
+        next
+    }
+}
+/// The sole download entry point. Only the explicit UI command calls it.
+/// Cancellation before the atomic commit retains the prior set and time.
+pub async fn sync_catalogs() -> Result<PricingSyncResult, String> {
+    static SYNC: OnceLock<SyncCoordinator> = OnceLock::new();
+    SYNC.get_or_init(Default::default)
+        .run(|| sync_with(|source, etag| async move { download(source, &etag).await }))
+        .await
+}
+
+/// Caller holds the collection lock. The writer is the only fallible commit
+/// step; memory/generation change only after its atomic replacement succeeds.
+fn commit_catalogs(
+    next: Store,
+    result: PricingSyncResult,
+    persist: impl FnOnce() -> Result<(), String>,
+) -> Result<PricingSyncResult, String> {
+    persist()?;
+    *store().lock().unwrap() = next;
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(result)
+}
+
+async fn sync_with<F, Fut>(fetch: F) -> Result<PricingSyncResult, String>
+where
+    F: FnMut(&'static str, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Download, String>>,
+{
+    let old = {
+        let mut s = store().lock().unwrap();
+        if !s.loaded_from_disk {
+            load_from_disk(&mut s);
+        }
+        s.bundle.clone()
+    };
+    let bundle = prepare_bundle(old.as_ref(), now_ms(), fetch).await?;
+    let mut next = Some(validate_bundle(&bundle)?);
+    let raw = serde_json::to_string(&bundle).map_err(|_| "Cannot serialize catalogs")?;
+    let result = PricingSyncResult {
+        last_success_ms: bundle.last_success_ms,
+        catalog_stamp: bundle_stamp(&bundle),
+    };
+    // Do not block a runtime thread waiting for a minutes-long log walk.
+    // No await inside commit: cancellation can discard only the whole batch.
+    loop {
+        if let Some(committed) = crate::spend::try_pricing_commit(|| {
+            commit_catalogs(next.take().unwrap(), result.clone(), || {
+                crate::private_file::atomic_write(&dir().join("catalogs.json"), &raw)
+            })
+        }) {
+            return committed;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lookup
+// ---------------------------------------------------------------------------
+
+/// USD per million tokens for `model`, or None if no source prices it.
+/// Memoized; local bundle and baked-in prices only, never network.
+pub fn lookup(model: &str) -> Option<Price> {
+    let mut s = store().lock().unwrap();
+    if !s.loaded_from_disk {
+        load_from_disk(&mut s);
+    }
+    if let Some(hit) = s.memo.get(model) {
+        return *hit;
+    }
+    let result = resolve(&s, model, 0);
+    s.memo.insert(model.to_string(), result);
+    result
+}
+
+/// Every rate in `p` multiplied by `m` — service tiers (fast, priority)
+/// bill at a multiple of the base model's whole rate card.
+fn scaled_price(p: &Price, m: f64) -> Price {
+    let scale = |v: Option<f64>| v.map(|x| x * m);
+    Price {
+        input: p.input * m,
+        output: p.output * m,
+        cache_read: p.cache_read * m,
+        cache_write: p.cache_write * m,
+        input_200k: scale(p.input_200k),
+        output_200k: scale(p.output_200k),
+        cache_read_200k: scale(p.cache_read_200k),
+        cache_write_200k: scale(p.cache_write_200k),
+        cache_write_1h: scale(p.cache_write_1h),
+        cache_write_1h_200k: scale(p.cache_write_1h_200k),
+    }
+}
+
+fn resolve(s: &Store, model: &str, depth: u8) -> Option<Price> {
+    // Alias rules come from a third-party URL; a crafted rule set could
+    // otherwise bounce a name between an alias and the -max strip below
+    // forever ("foo" → "foo-max" → "foo" → …) and overflow the stack.
+    if depth >= 4 {
+        return None;
+    }
+    let canonical = s
+        .alias_rules
+        .iter()
+        .find(|(re, _)| re.is_match(model))
+        .map(|(_, c)| c.clone())
+        .unwrap_or_else(|| model.to_string());
+
+    // A catalog row with zero input AND output rates is ambiguous: brand-new
+    // slugs often land as 0/0 placeholders (qwen3.8-max), but free-tier and
+    // local models are legitimately 0/0. Resolution order settles it — the
+    // filtered chain below only takes entries with real rates, and 0/0
+    // entries are reconsidered near the end (after the baked table), so a
+    // placeholder loses to real rates anywhere while a model that is 0/0
+    // in every source still prices as genuinely free, never as unpriced.
+    let real = |p: &&Price| p.input > 0.0 || p.output > 0.0;
+    if let Some(p) = s.supplement.get(&canonical).filter(real) {
+        return Some(*p);
+    }
+    // Moonshot bills Pane's Kimi Code / API logs on its own card. LiteLLM
+    // and models.dev mix reseller markups and stubs that drop cache-hit
+    // rates, so first-party Kimi slugs take the published Moonshot table
+    // before those catalogs. Other baked models (DeepSeek, Grok, Qwen)
+    // still sit after catalogs so they self-retire.
+    if let Some(p) = kimi_vendor_price(&canonical) {
+        return Some(p);
+    }
+    // Kimi HighSpeed is a published 2× serving tier, not a distinct model.
+    // Only peel known Kimi bases so an unrelated `-highspeed` slug cannot
+    // inherit a 2× multiplier.
+    if let Some(base) = canonical.strip_suffix("-highspeed") {
+        if kimi_vendor_price(base).is_some() {
+            if let Some(p) = resolve(s, base, depth + 1) {
+                return Some(scaled_price(&p, 2.0));
+            }
+        }
+    }
+    if let Some(p) = s.litellm.get(&canonical).filter(real) {
+        return Some(*p);
+    }
+    // Fast tier: base price × the supplement's multiplier (default 2). The
+    // base runs through the whole chain — not a bare map lookup — so
+    // composed slugs like "gpt-5.6-sol-max-fast" reach the -max fallback
+    // and alias/fuzzy matching too.
+    if let Some(base) = canonical.strip_suffix("-fast") {
+        // Cognition's `-fast` is a Devin mode (`swe-1-6-fast`), not
+        // Cursor's 2× SKU. Price at the SWE/Penguin card. Lightning is
+        // its own 5× slug and never ends in `-fast`.
+        let mut stem = base.rsplit('/').next().unwrap_or(base);
+        for suf in ["-xhigh", "-light", "-low", "-medium", "-high", "-max", "-ultra"] {
+            if let Some(next) = stem.strip_suffix(suf) {
+                stem = next;
+            }
+        }
+        if matches!(stem, "swe-1.7" | "swe-1-7" | "swe-1.6" | "swe-1-6" | "penguin") {
+            return resolve(s, base, depth + 1);
+        }
+        // Multipliers are keyed by the plain model name; peel effort/mode
+        // tokens off composed bases ("gpt-5.6-sol-max" → "gpt-5.6-sol") so
+        // "sol-max-fast" gets sol's real multiplier, not the default.
+        let mut mkey = base;
+        let m = loop {
+            if let Some(m) = s.fast_multipliers.get(mkey) {
+                break *m;
+            }
+            match ["-xhigh", "-light", "-low", "-medium", "-high", "-max", "-ultra"]
+                .iter()
+                .find_map(|suf| mkey.strip_suffix(suf))
+            {
+                Some(next) => mkey = next,
+                None => break 2.0,
+            }
+        };
+        if let Some(p) = resolve(s, base, depth + 1) {
+            return Some(scaled_price(&p, m));
+        }
+    }
+    // Priority processing tier: some CLIs (Devin) bake the service tier
+    // into the slug itself ("gpt-5.6-luna-xhigh-priority") instead of
+    // flagging it per turn the way Codex rollouts do. OpenAI bills
+    // priority at a per-model multiplier over the standard rate — keep
+    // this table in sync with spend.rs's codex_priority_multiplier.
+    if let Some(base) = canonical.strip_suffix("-priority") {
+        let mut mkey = base;
+        while let Some(next) = ["-xhigh", "-light", "-low", "-medium", "-high", "-max", "-ultra"]
+            .iter()
+            .find_map(|suf| mkey.strip_suffix(suf))
+        {
+            mkey = next;
+        }
+        let m = if matches!(mkey, "gpt-5.5" | "gpt-5.5-pro") { 2.5 } else { 2.0 };
+        if let Some(p) = resolve(s, base, depth + 1) {
+            return Some(scaled_price(&p, m));
+        }
+    }
+    // LiteLLM fuzzy: provider-prefixed keys like "anthropic/claude-…".
+    // Prefer an exact segment match; never fuzzy-match models.dev.
+    if let Some(p) = s
+        .litellm
+        .iter()
+        .find(|(k, p)| k.rsplit('/').next() == Some(canonical.as_str()) && real(p))
+        .map(|(_, p)| *p)
+    {
+        return Some(p);
+    }
+    if let Some(p) = s.modelsdev.get(&canonical).filter(real) {
+        return Some(*p);
+    }
+    // Vendor-documented rates for models the live catalogs haven't learned
+    // yet — consulted after every online source so a real catalog entry
+    // always wins the moment one ships. Keep this list tiny and sourced.
+    if let Some(p) = builtin_price(&canonical) {
+        return Some(p);
+    }
+    // DeepSeek ships dated snapshots ("deepseek-v4-pro-0813"): when no
+    // source knows the dated form, retry the base slug through the WHOLE
+    // chain — a catalog that has learned the base model must outrank the
+    // baked table for dated spellings too, or the table would never
+    // self-retire for them. Scoped to deepseek slugs with an all-digit
+    // ≥4-char tail so version-bearing names never lose a real tail.
+    // Last path segment so gateway prefixes (Fireworks, AihubMix, …)
+    // still date-trim: Hermes logs
+    // `accounts/fireworks/models/deepseek-v4-pro-0813`.
+    let slug = canonical.rsplit('/').next().unwrap_or(canonical.as_str());
+    if let Some((head, tail)) = slug.rsplit_once('-') {
+        if slug.starts_with("deepseek")
+            && tail.len() >= 4
+            && tail.chars().all(|c| c.is_ascii_digit())
+        {
+            if let Some(p) = resolve(s, head, depth + 1) {
+                return Some(p);
+            }
+        }
+    }
+    // Zero-rate entries, reconsidered: nothing anywhere carries real rates
+    // for this slug, so a 0/0 catalog row means the model is genuinely
+    // free — take it, keeping free models at $0.00 without an unpriced ⚠.
+    if let Some(p) = s.supplement.get(&canonical) {
+        return Some(*p);
+    }
+    if let Some(p) = s.litellm.get(&canonical) {
+        return Some(*p);
+    }
+    if let Some(p) = s
+        .litellm
+        .iter()
+        .find(|(k, _)| k.rsplit('/').next() == Some(canonical.as_str()))
+        .map(|(_, p)| *p)
+    {
+        return Some(p);
+    }
+    if let Some(p) = s.modelsdev.get(&canonical) {
+        return Some(*p);
+    }
+    // Slug tails no catalog carries under their own name, billed at the
+    // base model's per-token rates: reasoning-effort tiers (they change how
+    // many tokens burn, not the unit price) and Cursor's Max/Ultra modes
+    // (token-based at model rates). Only when the whole chain above misses
+    // does one trailing token get peeled and the rest rerun — compositions
+    // unwind right to left ("…-max-xhigh" → "…-max" → base), the depth cap
+    // bounds it, and a real entry for any tail in any source always wins.
+    for suffix in ["-xhigh", "-light", "-low", "-medium", "-high", "-max", "-ultra"] {
+        if let Some(base) = canonical.strip_suffix(suffix) {
+            return resolve(s, base, depth + 1);
+        }
+    }
+    None
+}
+
+/// First-party Moonshot / Kimi rates from platform.kimi.ai (USD/MTok).
+/// Last-segment match so CLI plan logs (`kimi-code/k3`), API prefixes
+/// (`moonshot-ai/kimi-k3`), and Codex OAuth (`kimi-oauth/k3`) share one
+/// table. Cache writes unpublished → input rate.
+///
+/// Generic tails (`k3`, `k2.5`) only match when the slug is bare or under
+/// a Kimi/Moonshot prefix — `openrouter/k3` must not steal this card
+/// ahead of that provider's catalog row. Tails that already say `kimi-`
+/// / `moonshot-` (Fireworks `kimi-k2p7-code`) match under any prefix.
+fn kimi_vendor_price(canonical: &str) -> Option<Price> {
+    let bare = kimi_vendor_tail(canonical)?.to_ascii_lowercase();
+    match bare.as_str() {
+
+        // platform.kimi.ai/docs/pricing/chat-k3 — k3-256k is the same API
+        // rate card (the 2× figure on the membership page is plan *quota*,
+        // not dollars).
+        "k3" | "k3-256k" | "kimi-k3" | "kimi-k3-code" => Some(Price::flat(3.0, 15.0, 0.3, 3.0)),
+        // platform.kimi.ai/docs/pricing/chat-k27-code — Kimi Code's
+        // `kimi-for-coding` id is this model. HighSpeed is published at 2×.
+        // `kimi-k2p7*` is Fireworks' spelling of the same SKU.
+        "kimi-for-coding" | "kimi-k2.7-code" | "kimi-k2.7" | "k2.7-code"
+        | "kimi-k2p7-code" | "kimi-k2p7" => Some(Price::flat(0.95, 4.0, 0.19, 0.95)),
+        "kimi-for-coding-highspeed" | "kimi-k2.7-code-highspeed" | "k2.7-code-highspeed"
+        | "kimi-k2p7-code-highspeed" => Some(Price::flat(1.90, 8.0, 0.38, 1.90)),
+        // platform.kimi.ai/docs/pricing/chat-k26
+        "kimi-k2.6" | "kimi-k2p6" | "k2.6" => Some(Price::flat(0.95, 4.0, 0.16, 0.95)),
+        // platform.kimi.ai/docs/pricing/chat-k25
+        "kimi-k2.5" | "kimi-k2p5" | "k2.5" => Some(Price::flat(0.60, 3.0, 0.10, 0.60)),
+        // platform.kimi.ai/docs/pricing/chat-v1 — no cache-hit column;
+        // unpublished cache bills at the input rate. Vision SKUs share
+        // the same dollar card as the matching context size.
+        "moonshot-v1-8k" | "moonshot-v1-8k-vision-preview" | "moonshot-v1-8k-0430" => {
+            Some(Price::flat(0.20, 2.0, 0.20, 0.20))
+        }
+        "moonshot-v1-32k" | "moonshot-v1-32k-vision-preview" | "moonshot-v1-32k-0430" => {
+            Some(Price::flat(1.0, 3.0, 1.0, 1.0))
+        }
+        "moonshot-v1-128k" | "moonshot-v1-128k-vision-preview" | "moonshot-v1-128k-0430" => {
+            Some(Price::flat(2.0, 5.0, 2.0, 2.0))
+        }
+        _ => None,
+    }
+}
+
+fn kimi_vendor_tail(canonical: &str) -> Option<&str> {
+    let lower = canonical.to_ascii_lowercase();
+    let tail = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    let named = tail.starts_with("kimi") || tail.starts_with("moonshot");
+    let known_prefix = [
+        "moonshot-ai/",
+        "moonshotai/",
+        "kimi-code/",
+        "kimi-oauth/",
+        "moonshot/",
+        "kimi/",
+    ]
+    .iter()
+    .any(|p| lower.starts_with(p));
+    if named || known_prefix || !canonical.contains('/') {
+        canonical.rsplit('/').next()
+    } else {
+        None
+    }
+}
+
+fn builtin_price(canonical: &str) -> Option<Price> {
+    // Gateways prefix the vendor slug (`xai/grok-4.6`, `deepseek/…`,
+    // `accounts/fireworks/models/deepseek-v4-pro`). Peel to the last
+    // path segment so one arm covers every spelling; catalogs still
+    // outrank this table (except Kimi — see kimi_vendor_price) because
+    // resolve() consults them first.
+    if let Some(p) = kimi_vendor_price(canonical) {
+        return Some(p);
+    }
+    match canonical {
+        "aihubmix/hy4-preview" => return Some(Price::flat(0.845, 2.535, 0.04225, 0.845)),
+        "aihubmix/qwen3.8-flash" => {
+            return Some(Price::flat(0.1126, 0.380025, 0.014075, 0.175937));
+        }
+        // AihubMix Qwen3.8-Max-0902 (aihubmix.com/model/qwen3.8-max-2026-09-02):
+        // $1.69 in / $5.07 out / $0.169 cache read / $2.1125 cache write.
+        // Same headline card as their live `qwen3.8-max` page; this SKU is
+        // the dated snapshot Hermes logs. Scoped so Alibaba's $2/$6
+        // `qwen3.8-max` arm is untouched.
+        "aihubmix/qwen3.8-max-2026-09-02" => {
+            return Some(Price::flat(1.69, 5.07, 0.169, 2.1125));
+        }
+        _ => {}
+    }
+    let bare = canonical.rsplit('/').next().unwrap_or(canonical);
+    match bare {
+        // AihubMix DeepSeek V4 family — the gateway's OWN rate cards
+        // (aihubmix.com/model/deepseek-v4-pro-0813 and /deepseek-v4-flash
+        // headline pricing, NOT the cheaper Baidu/Tencent provider rows on
+        // the same pages): pro $0.464/$0.928 with $0.004 cache read (yes,
+        // ~1/116 of input — the page really says $0.004), flash
+        // $0.154/$0.308 with $0.003 cache read. No cache-write rate is
+        // published, so writes bill at the input rate. Hermes logs these
+        // bare ("deepseek-v4-flash", "deepseek-v4-pro-0813" — verified
+        // against a real state.db); public catalogs don't carry them yet.
+        // Dated snapshots reach these arms via resolve()'s date-trim
+        // retry, so a catalog that learns the base slug outranks them.
+        "deepseek-v4-pro" => Some(Price::flat(0.464, 0.928, 0.004, 0.464)),
+        "deepseek-v4-flash" => Some(Price::flat(0.154, 0.308, 0.003, 0.154)),
+        // DeepSeek V4.1 Flash — official card effective 2026-09-10
+        // (deepseek.com pricing): off-peak $0.15 in / $0.60 out /
+        // $0.003 cache read. AihubMix routes bill the gateway's own card
+        // (~3.3% over official, per aihubmix.com/model/deepseek-v4.1-flash).
+        // Cache write is unpublished, so writes bill at input. Weekday
+        // peak hours (01:00–04:00 and 06:00–10:00 UTC) bill at 2× the
+        // whole card — applied per event by peak_multiplier(); events
+        // before the changeover bill the flat launch card via
+        // v41_flash_legacy_card(). Its own SKU — must not inherit
+        // v4-flash's $0.154/$0.003 card. The hyphen spelling covers logs
+        // that drop the version dot.
+        "deepseek-v4.1-flash" | "deepseek-v4-1-flash" => {
+            if canonical.starts_with("aihubmix/") {
+                Some(Price::flat(0.155, 0.62, 0.0031, 0.155))
+            } else {
+                Some(Price::flat(0.15, 0.60, 0.003, 0.15))
+            }
+        }
+        // AihubMix GLM-5.3 preview (aihubmix.com/model/coding-glm-5.3):
+        // $0.060 in / $0.220 out per MTok. No cache rate is published, so
+        // reads/writes bill at the input rate. Only this gateway SKU is
+        // baked — the generic vendor name `glm-5.3` is left unpriced so
+        // Z.ai / OpenRouter / other scanners don't inherit the discount.
+        // Hermes still prices its AihubMix `glm-5.3` rows by looking up
+        // this SKU (see providers::hermes::price_lookup_slug).
+        "coding-glm-5.3" => Some(Price::flat(0.06, 0.22, 0.06, 0.06)),
+        // Alibaba Model Studio, GA'd 2026-08-03 (USD/MTok): input $2,
+        // output $6, implicit cache read $0.25, explicit cache write $2.50.
+        // Public catalogs still carry 0/0 placeholders for these slugs.
+        "qwen3.8-max" | "qwen3.8-max-preview" => Some(Price::flat(2.0, 6.0, 0.25, 2.5)),
+        // Grok 4.6, released 2026-08-12 — docs.x.ai/docs/pricing (USD/MTok):
+        // $2 in / $0.50 cached / $6 out; prompts ≥200k bill $4 / $1 / $12
+        // for the WHOLE request (xAI's long-context rule matches
+        // request_cost's tiering, and Grok spend passes the default 200k
+        // threshold). xAI bills no separate cache-write rate — writes are
+        // plain input. The announced 2x "-fast" variant needs no entry:
+        // the -fast resolution path applies the default 2x multiplier to
+        // this rate card. Public catalogs don't carry 4.6 yet.
+        // The cursor- spellings are Cursor's CSV branding for the same
+        // vendor-billed model ("cursor-grok-4.6-xhigh" on launch day) —
+        // matched EXPLICITLY rather than via a generic cursor- prefix
+        // strip, so other cursor-branded slugs (which Cursor may bill at
+        // its own rates) can never silently price off this baked table.
+        "grok-4.6" | "grok-4-6" | "cursor-grok-4.6" | "cursor-grok-4-6" => Some(Price {
+            input_200k: Some(4.0),
+            output_200k: Some(12.0),
+            cache_read_200k: Some(1.0),
+            cache_write_200k: Some(4.0),
+            ..Price::flat(2.0, 6.0, 0.5, 2.0)
+        }),
+        // GPT-6 Astra — OpenAI list (developers.openai.com/api/docs/models/gpt-6-astra):
+        // $10 / $50 / $1 cache read / $12.50 cache write. Prompts above
+        // 272k (Codex path) or 200k (generic request_cost) bill the
+        // whole request at $20 / $75 / $2 / $25. Public catalogs do not
+        // carry this slug yet; without a baked row, spend tiles go blank.
+        "gpt-6-astra" => Some(Price {
+            input_200k: Some(20.0),
+            output_200k: Some(75.0),
+            cache_read_200k: Some(2.0),
+            cache_write_200k: Some(25.0),
+            ..Price::flat(10.0, 50.0, 1.0, 12.5)
+        }),
+        // Gemini 3.8 Flash — Google API list through 2026-12-31
+        // (ai.google.dev/gemini-api/docs/pricing): $0.75 in / $3.75 out /
+        // $0.075 cache read / $0.75 cache write. Cursor effort tails
+        // (-high, -xhigh) peel in resolve(); preview is its own SKU.
+        "gemini-3.8-flash" | "gemini-3-8-flash" | "gemini-3.8-flash-preview"
+        | "cursor-gemini-3.8-flash" => Some(Price::flat(0.75, 3.75, 0.075, 0.75)),
+        // Cognition SWE / Penguin — LiteLLM Cognition cost map
+        // (docs.litellm.ai/docs/providers/cognition) and Devin's
+        // in-app rate card: $0.50 / $2.50 / $0.20 cache read. Cache
+        // write is unpublished, so writes bill at input. Devin CLI
+        // logs hyphenated slugs (`swe-1-7`, `penguin-max`); dotted
+        // LiteLLM spellings are included too. Lightning is the 5×
+        // Cerebras tier.
+        "swe-1.7" | "swe-1-7" | "swe-1.6" | "swe-1-6" | "penguin" => {
+            Some(Price::flat(0.50, 2.50, 0.20, 0.50))
+        }
+        "swe-1.7-lightning" | "swe-1-7-lightning" => {
+            Some(Price::flat(2.50, 12.50, 1.00, 2.50))
+        }
+        // StepFun Step Plan (platform.stepfun.ai pricing, USD/MTok):
+        // step-3.7-flash $0.20 in / $1.15 out / $0.04 cache hit;
+        // step-3.5-flash (+ the -2603 dated SKU) $0.10 / $0.30 / $0.02.
+        // No separate cache-write rate — writes bill at input. The
+        // last-segment peel above covers `stepfun/step-*` gateway slugs.
+        "step-3.7-flash" => Some(Price::flat(0.20, 1.15, 0.04, 0.20)),
+        "step-3.5-flash" | "step-3.5-flash-2603" => Some(Price::flat(0.10, 0.30, 0.02, 0.10)),
+        // step-5-preview is absent from StepFun's own price pages; the rate
+        // comes from Artificial Analysis (artificialanalysis.ai/models/step-5,
+        // 2026-09-19): $1.00 in / $2.70 out, 95% cache discount → $0.05.
+        "step-5-preview" => Some(Price::flat(1.00, 2.70, 0.05, 1.00)),
+        // StepFun audio models (platform.stepfun.ai pricing, USD/MTok).
+        "stepaudio-2.5-realtime" => Some(Price::flat(1.50, 10.00, 0.30, 1.50)),
+        "stepaudio-2.5-chat" => Some(Price::flat(1.50, 3.50, 0.30, 1.50)),
+        // free (limited time) per StepFun's price list.
+        "stepaudio-3-realtime-preview" | "stepaudio-3-chat-preview" => {
+            Some(Price::flat(0.0, 0.0, 0.0, 0.0))
+        }
+        // CN-only models — ≈ from CNY list price, 7 元/$
+        // (platform.stepfun.com): step-1o-turbo-vision 2.5/8/0.5 元,
+        // step-1o-audio 25/60/5 元, step-audio-2 10/70/2 元,
+        // step-audio-r1.5 10/105/2 元.
+        "step-1o-turbo-vision" => Some(Price::flat(0.36, 1.14, 0.07, 0.36)),
+        "step-1o-audio" => Some(Price::flat(3.57, 8.57, 0.71, 3.57)),
+        "step-audio-2" => Some(Price::flat(1.43, 10.00, 0.29, 1.43)),
+        "step-audio-r1.5" => Some(Price::flat(1.43, 15.00, 0.29, 1.43)),
+        // Deliberately unpriced — StepFun publishes no token rate for
+        // these, so rows keep the unpriced ⚠ instead of a guessed dollar
+        // figure: step-router-v1, step-overture-preview, step-2x-large,
+        // step-gui; step-image-edit-2 bills per image;
+        // TTS/ASR bill per character/hour.
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{request_cost, Price, Usage};
+
+    fn usage(input: f64, output: f64, cache_read: f64, w5m: f64, w1h: f64) -> Usage {
+        Usage { input, output, cache_read, cache_write_5m: w5m, cache_write_1h: w1h }
+    }
+
+    #[test]
+    fn modelsdev_prefers_the_most_complete_reseller_entry() {
+        // A stub reseller listing kimi-k3 without cache rates must not
+        // shadow a complete entry (alphabetical order made "aaa" win before,
+        // silently pricing $0.30 cache hits at the $3.00 input rate).
+        let doc = serde_json::json!({
+            "aaa-stub": { "models": { "kimi-k3": { "cost": { "input": 3.0, "output": 15.0 } } } },
+            "moonshotai": { "models": { "kimi-k3": {
+                "cost": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.0 }
+            } } },
+        });
+        let map = super::parse_modelsdev(&doc);
+        let p = map.get("kimi-k3").expect("kimi-k3 parsed");
+        assert_eq!((p.input, p.output, p.cache_read, p.cache_write), (3.0, 15.0, 0.3, 3.0));
+    }
+
+    #[test]
+    fn zero_rate_catalog_placeholders_are_skipped() {
+        let mut store = super::Store::default();
+        store.litellm.insert("qwen-test".into(), super::Price::flat(0.0, 0.0, 0.0, 0.0));
+        store.modelsdev.insert("qwen-test".into(), super::Price::flat(1.0, 5.0, 0.1, 1.25));
+        // The 0/0 litellm placeholder must not shadow models.dev's real price.
+        let p = super::resolve(&store, "qwen-test", 0).unwrap();
+        assert!((p.input - 1.0).abs() < 1e-9);
+
+        // Zero in EVERY source → the model is genuinely free: price $0.00
+        // (no unpriced ⚠), like ":free" gateway variants and local models.
+        store.modelsdev.insert("qwen-test".into(), super::Price::flat(0.0, 0.0, 0.0, 0.0));
+        let free = super::resolve(&store, "qwen-test", 0).unwrap();
+        assert_eq!((free.input, free.output), (0.0, 0.0));
+
+        // The baked table outranks 0/0 placeholders: a catalog that lists
+        // qwen3.8-max as 0/0 must not shadow Alibaba's documented rates.
+        store.litellm.insert("qwen3.8-max".into(), super::Price::flat(0.0, 0.0, 0.0, 0.0));
+        let baked = super::resolve(&store, "qwen3.8-max", 0).unwrap();
+        assert!((baked.input - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn priority_slugs_price_at_base_times_priority_multiplier() {
+        let mut store = super::Store::default();
+        store
+            .supplement
+            .insert("gpt-5.6-luna".into(), super::Price::flat(0.2, 1.2, 0.02, 0.25));
+        // Devin logs the service tier inside the slug; effort tokens between
+        // the base and -priority must not break resolution.
+        let p = super::resolve(&store, "gpt-5.6-luna-xhigh-priority", 0).unwrap();
+        assert!((p.input - 0.4).abs() < 1e-9);
+        assert!((p.output - 2.4).abs() < 1e-9);
+        assert!((p.cache_read - 0.04).abs() < 1e-9);
+
+        // gpt-5.5's priority tier is 2.5x, not the default 2x.
+        store.supplement.insert("gpt-5.5".into(), super::Price::flat(10.0, 45.0, 1.0, 1.25));
+        let p55 = super::resolve(&store, "gpt-5.5-priority", 0).unwrap();
+        assert!((p55.input - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stale_gpt56_supplement_prices_are_corrected_until_upstream_updates() {
+        let stale = serde_json::json!({ "pricing": {
+            "gpt-5.6-terra": { "input_per_million": 2.5, "output_per_million": 15.0,
+                               "cache_read_per_million": 0.25, "cache_write_per_million": 3.125 },
+            "gpt-5.6-luna":  { "input_per_million": 1.0, "output_per_million": 6.0,
+                               "cache_read_per_million": 0.1, "cache_write_per_million": 1.25 },
+        }});
+        let mut store = super::Store::default();
+        super::apply_supplement(&mut store, &stale);
+        let terra = store.supplement.get("gpt-5.6-terra").unwrap();
+        assert_eq!((terra.input, terra.output, terra.cache_read), (2.0, 12.0, 0.2));
+        let luna = store.supplement.get("gpt-5.6-luna").unwrap();
+        assert_eq!((luna.input, luna.output, luna.cache_read), (0.2, 1.2, 0.02));
+
+        // Self-retiring: any NEW upstream number passes through untouched.
+        let updated = serde_json::json!({ "pricing": {
+            "gpt-5.6-terra": { "input_per_million": 1.75, "output_per_million": 11.0 },
+        }});
+        super::apply_supplement(&mut store, &updated);
+        let terra = store.supplement.get("gpt-5.6-terra").unwrap();
+        assert_eq!((terra.input, terra.output), (1.75, 11.0));
+    }
+
+    #[test]
+    fn deepseek_v4_builtins_price_including_dated_snapshots() {
+        let store = super::Store::default();
+        // Real Hermes slugs: bare flash, dated pro snapshot, and the
+        // deepseek/-prefixed catalog spelling.
+        for slug in [
+            "deepseek-v4-pro",
+            "deepseek-v4-pro-0813",
+            "deepseek/deepseek-v4-pro-0813",
+            "accounts/fireworks/models/deepseek-v4-pro-0813",
+        ] {
+            let p = super::resolve(&store, slug, 0).unwrap_or_else(|| panic!("{slug} unpriced"));
+            assert!((p.input - 0.464).abs() < 1e-9, "{slug}");
+            assert!((p.output - 0.928).abs() < 1e-9, "{slug}");
+            // AihubMix really does list $0.004/M cache read for pro —
+            // ~1/116 of input is the vendor's number, not a typo.
+            assert!((p.cache_read - 0.004).abs() < 1e-9, "{slug}");
+        }
+        for slug in ["deepseek-v4-flash", "deepseek-v4-flash-0731"] {
+            let p = super::resolve(&store, slug, 0).unwrap_or_else(|| panic!("{slug} unpriced"));
+            assert!((p.input - 0.154).abs() < 1e-9, "{slug}");
+            assert!((p.cache_read - 0.003).abs() < 1e-9, "{slug}");
+        }
+        // V4.1 Flash's official card (effective 2026-09-10): off-peak
+        // $0.15/$0.60/$0.003 — its own SKU, not v4-flash's card. Weekday
+        // peak hours double it (peak_multiplier suite below). AihubMix
+        // routes bill the gateway's ~3.3% markup card.
+        for slug in ["deepseek-v4.1-flash", "deepseek-v4-1-flash", "deepseek/deepseek-v4.1-flash"] {
+            let p = super::resolve(&store, slug, 0).unwrap_or_else(|| panic!("{slug} unpriced"));
+            assert!((p.input - 0.15).abs() < 1e-9, "{slug}");
+            assert!((p.output - 0.60).abs() < 1e-9, "{slug}");
+            assert!((p.cache_read - 0.003).abs() < 1e-9, "{slug}");
+        }
+        let p = super::resolve(&store, "aihubmix/deepseek-v4.1-flash", 0).unwrap();
+        assert!((p.input - 0.155).abs() < 1e-9 && (p.output - 0.62).abs() < 1e-9);
+        assert!((p.cache_read - 0.0031).abs() < 1e-9);
+        // The trimmer never eats non-date tails or other families.
+        assert!(super::resolve(&store, "deepseek-v4", 0).is_none());
+        assert!(super::resolve(&store, "deepseek-v3.2", 0).is_none());
+
+        // Peak windows: 01:00–04:00 and 06:00–10:00 UTC on WEEKDAYS only,
+        // and never before the 2026-09-10T04:00Z changeover. 2026-09-10 is
+        // a Thursday; 2026-09-11 Friday; 2026-09-12 Saturday.
+        let ms = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis();
+        let peak = ["2026-09-10T06:00:00Z", "2026-09-10T08:00:00Z", "2026-09-11T01:00:00Z"];
+        for t in peak {
+            assert_eq!(super::peak_multiplier("deepseek-v4.1-flash", ms(t)), 2.0, "{t}");
+            assert_eq!(super::peak_multiplier("aihubmix/deepseek-v4.1-flash", ms(t)), 2.0, "{t}");
+            // Dated snapshot tails and effort suffixes peak too.
+            assert_eq!(super::peak_multiplier("deepseek-v4.1-flash-0910", ms(t)), 2.0, "{t}");
+            assert_eq!(super::peak_multiplier("deepseek-v4.1-flash-high", ms(t)), 2.0, "{t}");
+        }
+        let off = [
+            "2026-09-11T00:59:00Z", // just before window 1
+            "2026-09-11T04:00:00Z", // window 1 ends (exclusive)
+            "2026-09-11T05:30:00Z", // between windows
+            "2026-09-11T10:00:00Z", // window 2 ends
+            "2026-09-11T23:00:00Z", // late night
+            "2026-09-12T02:00:00Z", // Saturday in a peak window
+            "2026-09-09T02:00:00Z", // in-window but before the changeover
+        ];
+        for t in off {
+            assert_eq!(super::peak_multiplier("deepseek-v4.1-flash", ms(t)), 1.0, "{t}");
+        }
+        // Other models and the older flat SKU never scale.
+        assert_eq!(super::peak_multiplier("gpt-5.6-sol", ms("2026-09-11T02:00:00Z")), 1.0);
+        assert_eq!(super::peak_multiplier("deepseek-v4-flash", ms("2026-09-11T02:00:00Z")), 1.0);
+
+        // Pre-changeover events bill the flat launch card; later ones don't.
+        let legacy = super::v41_flash_legacy_card("deepseek-v4.1-flash", ms("2026-09-09T02:00:00Z"));
+        assert!(legacy.is_some());
+        let l = legacy.unwrap();
+        assert!((l.input - 0.142).abs() < 1e-9 && (l.output - 0.284).abs() < 1e-9);
+        assert!((l.cache_read - 0.0284).abs() < 1e-9);
+        assert!(super::v41_flash_legacy_card("deepseek-v4.1-flash", ms("2026-09-11T02:00:00Z")).is_none());
+        assert!(super::v41_flash_legacy_card("gpt-5.6-sol", ms("2026-09-09T02:00:00Z")).is_none());
+
+        // Session-window overlap: fully inside, spanning a boundary,
+        // weekend-only, pre-changeover clamp.
+        assert_eq!(
+            super::peak_overlap_ms(ms("2026-09-11T01:00:00Z"), ms("2026-09-11T02:00:00Z")),
+            3_600_000
+        );
+        assert_eq!(
+            super::peak_overlap_ms(ms("2026-09-11T00:30:00Z"), ms("2026-09-11T02:30:00Z")),
+            5_400_000 // 01:00–02:30
+        );
+        assert_eq!(
+            super::peak_overlap_ms(ms("2026-09-12T01:00:00Z"), ms("2026-09-12T02:00:00Z")),
+            0
+        );
+        assert_eq!(
+            super::peak_overlap_ms(ms("2026-09-09T02:00:00Z"), ms("2026-09-09T03:00:00Z")),
+            0
+        );
+
+        // Self-retirement holds for dated spellings too: once any catalog
+        // learns the BASE slug, dated snapshots follow the catalog, not
+        // the baked table (Devin's find — the trim must run in resolve,
+        // where the retry passes through every source, not in builtin).
+        let mut store = super::Store::default();
+        store.litellm.insert("deepseek-v4-pro".into(), super::Price::flat(0.5, 1.0, 0.05, 0.5));
+        let p = super::resolve(&store, "deepseek-v4-pro-0813", 0).unwrap();
+        assert!((p.input - 0.5).abs() < 1e-9);
+        assert!((p.cache_read - 0.05).abs() < 1e-9);
+        let p = super::resolve(&store, "accounts/fireworks/models/deepseek-v4-pro-0813", 0).unwrap();
+        assert!((p.input - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn glm_53_aihubmix_preview_prices() {
+        let store = super::Store::default();
+        for slug in ["coding-glm-5.3", "aihubmix/coding-glm-5.3"] {
+            let p = super::resolve(&store, slug, 0).unwrap_or_else(|| panic!("{slug} unpriced"));
+            assert!((p.input - 0.06).abs() < 1e-9, "{slug}");
+            assert!((p.output - 0.22).abs() < 1e-9, "{slug}");
+            // No cache rate on the vendor page — unpublished → input rate.
+            assert!((p.cache_read - 0.06).abs() < 1e-9, "{slug}");
+        }
+        // Generic vendor name (and gateway prefixes that peel to it) stay
+        // unpriced until a catalog learns an official rate.
+        assert!(super::resolve(&store, "glm-5.3", 0).is_none());
+        assert!(super::resolve(&store, "z-ai/glm-5.3", 0).is_none());
+        // A catalog that learns the official commercial slug outranks the
+        // preview card (self-retirement).
+        let mut store = super::Store::default();
+        store.litellm.insert("glm-5.3".into(), super::Price::flat(1.0, 3.0, 0.25, 1.0));
+        let p = super::resolve(&store, "glm-5.3", 0).unwrap();
+        assert!((p.input - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aihubmix_hy4_and_qwen38_flash_launch_prices_stay_scoped() {
+        let store = super::Store::default();
+        for slug in [
+            "hy4-preview",
+            "tencent/hy4-preview",
+            "qwen3.8-flash",
+            "qwen/qwen3.8-flash",
+        ] {
+            assert!(super::resolve(&store, slug, 0).is_none(), "{slug}");
+        }
+
+        let hy4 = super::resolve(&store, "aihubmix/hy4-preview", 0).unwrap();
+        assert_eq!((hy4.input, hy4.output, hy4.cache_read), (0.845, 2.535, 0.04225));
+        let qwen = super::resolve(&store, "aihubmix/qwen3.8-flash", 0).unwrap();
+        assert_eq!(
+            (qwen.input, qwen.output, qwen.cache_read, qwen.cache_write),
+            (0.1126, 0.380025, 0.014075, 0.175937)
+        );
+    }
+
+    #[test]
+    fn aihubmix_qwen38_max_0902_uses_gateway_card() {
+        let store = super::Store::default();
+        let p = super::resolve(&store, "aihubmix/qwen3.8-max-2026-09-02", 0).unwrap();
+        assert_eq!(
+            (p.input, p.output, p.cache_read, p.cache_write),
+            (1.69, 5.07, 0.169, 2.1125)
+        );
+        // Bare / other-gateway spellings stay off this discount card.
+        assert!(super::resolve(&store, "qwen3.8-max-0902", 0).is_none());
+        assert!(super::resolve(&store, "qwen3.8-max-2026-09-02", 0).is_none());
+        // Alibaba's GA card is unchanged.
+        let max = super::resolve(&store, "qwen3.8-max", 0).unwrap();
+        assert_eq!((max.input, max.output), (2.0, 6.0));
+        // A catalog row for the snapshot self-retires the bake.
+        let mut store = super::Store::default();
+        store.litellm.insert(
+            "aihubmix/qwen3.8-max-2026-09-02".into(),
+            super::Price::flat(9.0, 9.0, 0.9, 9.0),
+        );
+        let p = super::resolve(&store, "aihubmix/qwen3.8-max-2026-09-02", 0).unwrap();
+        assert_eq!((p.input, p.output), (9.0, 9.0));
+    }
+
+    #[test]
+    fn grok_46_builtin_prices_with_long_context_tier() {
+        // Vendor rates (docs.x.ai/docs/pricing): $2/$0.50/$6, doubling for
+        // ≥200k prompts — resolvable in every spelling before the public
+        // catalogs learn the model. Empty store = builtin only.
+        let store = super::Store::default();
+        // cursor-grok-4.6-xhigh is the exact slug Cursor's CSV logged on
+        // launch day — 20.6M real tokens showed $0.00 until it resolved.
+        for slug in
+            ["grok-4.6", "grok-4-6", "xai/grok-4.6", "grok-4.6-high", "cursor-grok-4.6-xhigh"]
+        {
+            let p = super::resolve(&store, slug, 0)
+                .unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!((p.input, p.output, p.cache_read, p.cache_write), (2.0, 6.0, 0.5, 2.0), "{slug}");
+            assert_eq!(
+                (p.input_200k, p.output_200k, p.cache_read_200k),
+                (Some(4.0), Some(12.0), Some(1.0)),
+                "{slug}"
+            );
+        }
+        // The fast variant is "twice the price" (launch post): the -fast
+        // path scales the whole rate card, long-context tier included.
+        let fast = super::resolve(&store, "grok-4.6-fast", 0).unwrap();
+        assert_eq!((fast.input, fast.output, fast.cache_read), (4.0, 12.0, 1.0));
+        assert_eq!(fast.input_200k, Some(8.0));
+    }
+
+    #[test]
+    fn gpt6_astra_and_gemini_38_flash_price_before_catalogs() {
+        let store = super::Store::default();
+        for slug in ["gpt-6-astra", "openai/gpt-6-astra", "gpt-6-astra-high"] {
+            let p = super::resolve(&store, slug, 0)
+                .unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!(
+                (p.input, p.output, p.cache_read, p.cache_write),
+                (10.0, 50.0, 1.0, 12.5),
+                "{slug}"
+            );
+            assert_eq!(
+                (p.input_200k, p.output_200k, p.cache_read_200k),
+                (Some(20.0), Some(75.0), Some(2.0)),
+                "{slug}"
+            );
+        }
+        let fast = super::resolve(&store, "gpt-6-astra-fast", 0).unwrap();
+        assert_eq!((fast.input, fast.output, fast.cache_read), (20.0, 100.0, 2.0));
+
+        for slug in [
+            "gemini-3.8-flash",
+            "google/gemini-3.8-flash",
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-preview",
+            "cursor-gemini-3.8-flash",
+        ] {
+            let p = super::resolve(&store, slug, 0)
+                .unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!(
+                (p.input, p.output, p.cache_read, p.cache_write),
+                (0.75, 3.75, 0.075, 0.75),
+                "{slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn cognition_swe_and_penguin_price_before_catalogs() {
+        let store = super::Store::default();
+        // Devin hyphen slugs, LiteLLM dots, modes, gateway prefix.
+        // `-fast` stays 1× (a Devin mode, not Cursor's 2× SKU).
+        for slug in [
+            "penguin",
+            "penguin-max",
+            "cognition/penguin",
+            "swe-1-7",
+            "swe-1.7",
+            "swe-1-7-medium",
+            "cognition/swe-1.7",
+            "swe-1-6",
+            "swe-1.6",
+            "swe-1-6-fast",
+        ] {
+            let p = super::resolve(&store, slug, 0)
+                .unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!(
+                (p.input, p.output, p.cache_read, p.cache_write),
+                (0.50, 2.50, 0.20, 0.50),
+                "{slug}"
+            );
+        }
+        for slug in ["swe-1-7-lightning", "swe-1.7-lightning", "cognition/swe-1.7-lightning"] {
+            let p = super::resolve(&store, slug, 0)
+                .unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!(
+                (p.input, p.output, p.cache_read, p.cache_write),
+                (2.50, 12.50, 1.00, 2.50),
+                "{slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_k3_builtin_prices_every_spelling() {
+        // Vendor-documented rates (platform.kimi.ai): $3 in, $15 out, $0.30
+        // cache hit — resolvable however each tool spells the slug.
+        for slug in [
+            "kimi-k3",                    // Cursor / Devin bare
+            "kimi-k3-code",               // Kimi Code CLI variant
+            "k3",                         // Kimi Code plan id (`kimi-code/k3`)
+            "k3-256k",                    // 256k K3 SKU, same API rates
+            "moonshot/kimi-k3",           // catalog-style prefix
+            "moonshot-ai/kimi-k3-code",   // Kimi CLI's own prefix
+            "kimi-code/k3",               // plan login, last-segment peel
+            "kimi-oauth/k3",              // Codex OAuth log
+            "kimi-k3-high",               // effort tier → peels to base
+            "kimi-k3-max",                // mode → peels to base
+        ] {
+            let p = super::lookup(slug).unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!((p.input, p.output, p.cache_read), (3.0, 15.0, 0.3), "{slug}");
+        }
+    }
+
+    #[test]
+    fn kimi_k27_code_and_highspeed_plan_spellings() {
+        // platform.kimi.ai/docs/pricing/chat-k27-code
+        for slug in [
+            "kimi-k2.7-code",
+            "kimi-for-coding",
+            "kimi-code/kimi-for-coding",
+        ] {
+            let p = super::lookup(slug).unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!((p.input, p.output, p.cache_read), (0.95, 4.0, 0.19), "{slug}");
+        }
+        for slug in [
+            "kimi-k2.7-code-highspeed",
+            "kimi-for-coding-highspeed",
+            "kimi-code/kimi-for-coding-highspeed",
+        ] {
+            let p = super::lookup(slug).unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!((p.input, p.output, p.cache_read), (1.90, 8.0, 0.38), "{slug}");
+        }
+    }
+
+    #[test]
+    fn stepfun_builtins_price() {
+        // Step Plan list prices (platform.stepfun.ai). Asserted at the
+        // builtin layer — a live catalog row outranks these at lookup().
+        let p = super::builtin_price("step-3.7-flash")
+            .expect("step-3.7-flash did not price");
+        assert_eq!((p.input, p.output, p.cache_read, p.cache_write), (0.20, 1.15, 0.04, 0.20));
+        // The gateway spelling peels to the same card.
+        let p = super::builtin_price("stepfun/step-3.7-flash")
+            .expect("stepfun/step-3.7-flash did not reach the builtin");
+        assert_eq!((p.input, p.output), (0.20, 1.15));
+        for slug in ["step-3.5-flash", "step-3.5-flash-2603"] {
+            let p = super::builtin_price(slug).unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!(
+                (p.input, p.output, p.cache_read, p.cache_write),
+                (0.10, 0.30, 0.02, 0.10),
+                "{slug}"
+            );
+        }
+        // Token-billed audio + CN-only models (≈ USD from the CNY list).
+        for (slug, want) in [
+            ("stepaudio-2.5-realtime", (1.50, 10.00, 0.30, 1.50)),
+            ("stepaudio-2.5-chat", (1.50, 3.50, 0.30, 1.50)),
+            ("step-1o-turbo-vision", (0.36, 1.14, 0.07, 0.36)),
+            ("step-1o-audio", (3.57, 8.57, 0.71, 3.57)),
+            ("step-audio-2", (1.43, 10.00, 0.29, 1.43)),
+            ("step-audio-r1.5", (1.43, 15.00, 0.29, 1.43)),
+        ] {
+            let p = super::builtin_price(slug).unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!(
+                (p.input, p.output, p.cache_read, p.cache_write),
+                want,
+                "{slug}"
+            );
+        }
+        // Limited-time-free: prices to $0.00, not unpriced.
+        for slug in ["stepaudio-3-realtime-preview", "stepaudio-3-chat-preview"] {
+            let p = super::builtin_price(slug).unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!((p.input, p.output), (0.0, 0.0), "{slug}");
+        }
+        // step-5-preview: Artificial Analysis rate ($1.00 / $2.70, 95% cache discount).
+        let p = super::builtin_price("step-5-preview").expect("step-5-preview prices");
+        assert_eq!((p.input, p.output, p.cache_read, p.cache_write), (1.00, 2.70, 0.05, 1.00));
+        for slug in ["step-router-v1", "step-overture-preview"] {
+            assert!(super::builtin_price(slug).is_none(), "{slug}");
+        }
+    }
+
+    #[test]
+    fn kimi_k26_k25_and_v1_use_published_rates() {
+        for slug in ["kimi-k2.6", "moonshot-ai/kimi-k2.6", "kimi-k2p6"] {
+            let p = super::lookup(slug).unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!((p.input, p.output, p.cache_read), (0.95, 4.0, 0.16), "{slug}");
+        }
+        for slug in ["kimi-k2.5", "moonshot-ai/kimi-k2.5", "kimi-code/k2.5"] {
+            let p = super::lookup(slug).unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!((p.input, p.output, p.cache_read), (0.60, 3.0, 0.10), "{slug}");
+        }
+        for (slug, want) in [
+            ("moonshot-v1-8k", (0.20, 2.0, 0.20)),
+            ("moonshot-v1-8k-vision-preview", (0.20, 2.0, 0.20)),
+            ("moonshot-v1-32k", (1.0, 3.0, 1.0)),
+            ("moonshot-v1-128k", (2.0, 5.0, 2.0)),
+            ("moonshot-ai/moonshot-v1-128k-vision-preview", (2.0, 5.0, 2.0)),
+        ] {
+            let p = super::lookup(slug).unwrap_or_else(|| panic!("{slug} did not price"));
+            assert_eq!((p.input, p.output, p.cache_read), want, "{slug}");
+        }
+    }
+
+    #[test]
+    fn kimi_vendor_beats_reseller_catalog_stubs() {
+        let mut store = super::Store::default();
+        store.litellm.insert("kimi-k2.5".into(), Price::flat(0.60, 3.0, 0.60, 0.60));
+        store.modelsdev.insert("kimi-k2.5".into(), Price::flat(0.50, 2.80, 0.125, 0.625));
+        let p = super::resolve(&store, "kimi-k2.5", 0).unwrap();
+        assert_eq!((p.input, p.output, p.cache_read), (0.60, 3.0, 0.10));
+    }
+
+    #[test]
+    fn kimi_vendor_ignores_foreign_prefix_on_short_tails() {
+        // Generic tails under another vendor must not steal Moonshot rates.
+        assert!(super::kimi_vendor_price("openrouter/k3").is_none());
+        assert!(super::kimi_vendor_price("acme/k2.5").is_none());
+        assert!(super::kimi_vendor_price("groq/k2.7-code").is_none());
+        // Bare plan ids and Kimi/Moonshot prefixes still match.
+        assert!(super::kimi_vendor_price("k3").is_some());
+        assert!(super::kimi_vendor_price("kimi-code/k3").is_some());
+        assert!(super::kimi_vendor_price("Kimi-OAuth/K3").is_some());
+        // A tail that already says kimi- is unambiguous even under Fireworks.
+        assert!(super::kimi_vendor_price("accounts/fireworks/models/kimi-k2p7-code").is_some());
+    }
+
+    #[test]
+    fn long_context_reprices_the_whole_request() {
+        let mut p = Price::flat(3.0, 15.0, 0.3, 3.75);
+        p.input_200k = Some(6.0);
+        p.output_200k = Some(22.5);
+        p.cache_read_200k = Some(0.6);
+
+        // Under the threshold: base rates.
+        let small = usage(150_000.0, 10_000.0, 0.0, 0.0, 0.0);
+        let expect = (150_000.0 * 3.0 + 10_000.0 * 15.0) / 1e6;
+        assert!((request_cost(&p, &small, true) - expect).abs() < 1e-9);
+
+        // Prompt over 200k: every component reprices, output included.
+        let big = usage(250_000.0, 10_000.0, 0.0, 0.0, 0.0);
+        let expect = (250_000.0 * 6.0 + 10_000.0 * 22.5) / 1e6;
+        assert!((request_cost(&p, &big, true) - expect).abs() < 1e-9);
+
+        // Aggregated sources opt out and stay on base rates.
+        let expect = (250_000.0 * 3.0 + 10_000.0 * 15.0) / 1e6;
+        assert!((request_cost(&p, &big, false) - expect).abs() < 1e-9);
+
+        // Cache reads count toward the threshold even with tiny input.
+        let cached = usage(1_000.0, 0.0, 240_000.0, 0.0, 0.0);
+        let expect = (1_000.0 * 6.0 + 240_000.0 * 0.6) / 1e6;
+        assert!((request_cost(&p, &cached, true) - expect).abs() < 1e-9);
+    }
+
+    #[test]
+    fn one_hour_cache_writes_bill_twice_input() {
+        let p = Price::flat(4.0, 20.0, 0.4, 5.0);
+        let u = usage(0.0, 0.0, 0.0, 0.0, 1_000_000.0);
+        assert!((request_cost(&p, &u, true) - 8.0).abs() < 1e-9);
+
+        // An explicit catalog rate wins over the ×2 convention.
+        let mut p = p;
+        p.cache_write_1h = Some(9.0);
+        assert!((request_cost(&p, &u, true) - 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn supplement_keeps_more_than_64_alias_rules() {
+        // The live feed is past 100 rules; a 64-cap dropped Daybreak and
+        // every Cursor Router "Auto Balanced" prose name.
+        let mut rules = Vec::new();
+        for i in 0..70 {
+            rules.push(serde_json::json!({
+                "pattern": format!("^dummy-{i}$"),
+                "canonical": "auto"
+            }));
+        }
+        rules.push(serde_json::json!({
+            "pattern": "^(?:gpt-)?daybreak-blue-latest$",
+            "canonical": "gpt-5.6-sol"
+        }));
+        let mut store = super::Store::default();
+        super::apply_supplement(&mut store, &serde_json::json!({ "alias_rules": rules }));
+        assert_eq!(store.alias_rules.len(), 71);
+        assert!(store.alias_rules.iter().any(|(_, c)| c == "gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn supplement_drops_out_of_range_prices_and_multipliers() {
+        // The supplement outranks every catalog in resolve(), so a hostile
+        // or corrupt feed must not name its own dollars: nothing real
+        // exceeds ~$600/M, and fast tiers stay within 1x-10x.
+        let doc = serde_json::json!({
+            "pricing": {
+                "absurd-model": { "input_per_million": 50_000.0, "output_per_million": 1.0 },
+                "negative-model": { "input_per_million": -1.0, "output_per_million": 1.0 },
+                "bad-cache-model": { "input_per_million": 1.0, "output_per_million": 2.0,
+                                     "cache_read_per_million": 99_999.0 },
+                "ceiling-model": { "input_per_million": 10_000.0, "output_per_million": 10_000.0 },
+                "sane-model": { "input_per_million": 3.0, "output_per_million": 15.0,
+                                "cache_read_per_million": 0.3, "cache_write_per_million": 3.75 },
+                "free-model": { "input_per_million": 0.0, "output_per_million": 0.0 },
+            },
+            "fast_multipliers": {
+                "absurd-model": 500.0,
+                "negative-model": 0.5,   // <1: fast cheaper than standard is nonsense
+                "sane-model": 2.0,
+                "ceiling-lo": 1.0,
+                "ceiling-hi": 10.0,
+            },
+        });
+        let mut store = super::Store::default();
+        super::apply_supplement(&mut store, &doc);
+        for model in ["absurd-model", "negative-model", "bad-cache-model"] {
+            assert!(!store.supplement.contains_key(model), "{model}");
+        }
+        assert_eq!(store.fast_multipliers.get("absurd-model"), None);
+        assert_eq!(store.fast_multipliers.get("negative-model"), None);
+        let p = store.supplement.get("sane-model").unwrap();
+        assert_eq!((p.input, p.output, p.cache_read, p.cache_write), (3.0, 15.0, 0.3, 3.75));
+        assert_eq!(store.fast_multipliers.get("sane-model"), Some(&2.0));
+        // Bounds are inclusive: the 0/0 free placeholder and the (unlikely
+        // but in-range) ceiling values survive, so edge data never drops.
+        assert!(store.supplement.contains_key("free-model"));
+        assert!(store.supplement.contains_key("ceiling-model"));
+        assert_eq!(store.fast_multipliers.get("ceiling-lo"), Some(&1.0));
+        assert_eq!(store.fast_multipliers.get("ceiling-hi"), Some(&10.0));
+    }
+
+    #[test]
+    fn supplement_alias_targets_are_plain_ascii_slugs() {
+        // Targets land in resolve() as model names — anything but a plain
+        // slug (control chars, spaces, unicode lookalikes, empty) drops.
+        let doc = serde_json::json!({ "alias_rules": [
+            { "pattern": "^good$", "canonical": "gpt-5.6-sol" },
+            { "pattern": "^prefixed$", "canonical": "openai/gpt_5.6.sol" },
+            { "pattern": "^control$", "canonical": "gpt-5.6\n-fake" },
+            { "pattern": "^spaces$", "canonical": "not a slug" },
+            { "pattern": "^unicode$", "canonical": "gрt-5.6" },
+            { "pattern": "^empty$", "canonical": "" },
+            { "pattern": "^long$", "canonical": "x".repeat(200) },
+        ]});
+        let mut store = super::Store::default();
+        super::apply_supplement(&mut store, &doc);
+        let targets: Vec<&str> = store.alias_rules.iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(targets, ["gpt-5.6-sol", "openai/gpt_5.6.sol"]);
+    }
+
+    /// Live probe: fetches the three catalogs and resolves a few real slugs.
+    /// Run via `cargo test --lib pricing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_probe() {
+        tauri::async_runtime::block_on(super::sync_catalogs()).unwrap();
+        let mut matrix: Vec<String> = vec![
+            "claude-opus-4-8".into(),
+            "gpt-5.1-codex-max-xhigh".into(),
+            "composer-2.5".into(),
+            "claude-4.5-haiku-thinking".into(),
+            "gpt-5".into(),
+            "some-unknown-model-xyz".into(),
+        ];
+        // The full GPT-5.6 family surface Cursor/Devin can emit: every
+        // effort tier, Max/Ultra modes, fast tier, and their compositions.
+        for base in ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"] {
+            matrix.push(base.to_string());
+            for suffix in [
+                "-light", "-low", "-medium", "-high", "-xhigh", "-max", "-ultra", "-fast",
+                "-max-xhigh", "-ultra-high", "-max-fast", "-fast-high",
+                "-light-fast", "-xhigh-fast", "-ultra-fast", "-max-fast-xhigh",
+            ] {
+                matrix.push(format!("{base}{suffix}"));
+            }
+        }
+        for model in &matrix {
+            // Cap each dump line: this runs with --nocapture straight to
+            // the terminal over data a third-party feed can influence.
+            let line = match super::lookup(model) {
+                Some(p) => format!(
+                    "{model}: in=${:.2} out=${:.2} cr=${:.3} cw=${:.2} (per 1M)",
+                    p.input, p.output, p.cache_read, p.cache_write
+                ),
+                None => format!("{model}: UNPRICED"),
+            };
+            eprintln!("{line:.200}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    fn write_bundle(path: &std::path::Path, bundle: &CatalogBundle) -> Result<(), String> {
+        validate_bundle(bundle)?;
+        let raw = serde_json::to_string(bundle).map_err(|_| "Cannot serialize catalogs")?;
+        crate::private_file::atomic_write(path, &raw)
+    }
+    #[test]
+    fn manual_sync_future_is_send_without_starting_network() {
+        fn send<T: Send>(_: T) {}
+        send(sync_catalogs());
+    }
+    fn response(source: &str, rate: f64) -> Download {
+        let doc = match source {
+            "litellm" => {
+                json!({"fixture-priced-model":{"input_cost_per_token":rate/1e6,"output_cost_per_token":rate/1e6}})
+            }
+            "modelsdev" => {
+                json!({"fixture":{"models":{"fixture-priced-model":{"cost":{"input":rate,"output":rate}}}}})
+            }
+            _ => {
+                json!({"pricing":{"fixture-priced-model":{"input_per_million":rate,"output_per_million":rate}}})
+            }
+        };
+        Download::Body(doc.to_string(), "fixture-etag".into())
+    }
+    async fn bundle(rate: f64, time: i64) -> CatalogBundle {
+        prepare_bundle(None, time, |source, _| {
+            std::future::ready(Ok(response(source, rate)))
+        })
+        .await
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn sync_failure_preserves_old_catalog_and_success_time() {
+        let old = bundle(1., 100).await;
+        let before = serde_json::to_string(&old).unwrap();
+        let calls = AtomicUsize::new(0);
+        let next = prepare_bundle(Some(&old), 200, |source, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(if source == "modelsdev" {
+                Err("offline".into())
+            } else {
+                Ok(response(source, 2.))
+            })
+        })
+        .await;
+        assert!(next.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(serde_json::to_string(&old).unwrap(), before);
+        assert_eq!(old.last_success_ms, 100);
+    }
+    #[tokio::test]
+    async fn validates_whole_set_and_304_requires_previous_source() {
+        assert!(prepare_bundle(None, 1, |_, _| std::future::ready(Ok(
+            Download::NotModified
+        )))
+        .await
+        .is_err());
+        for source in ["litellm", "modelsdev", "supplement"] {
+            assert!(
+                prepare_bundle(None, 1, |s, _| std::future::ready(Ok(if s == source {
+                    Download::Body("{}".into(), String::new())
+                } else {
+                    response(s, 1.)
+                })))
+                .await
+                .is_err()
+            );
+        }
+        let old = bundle(1., 100).await;
+        let next = prepare_bundle(Some(&old), 200, |_, etag| {
+            assert_eq!(etag, "fixture-etag");
+            std::future::ready(Ok(Download::NotModified))
+        })
+        .await
+        .unwrap();
+        assert_eq!(bundle_stamp(&old), bundle_stamp(&next));
+        assert_eq!(next.last_success_ms, 200);
+    }
+    #[tokio::test]
+    async fn repeated_clicks_coalesce_and_cancellation_releases_waiters() {
+        let sync = std::sync::Arc::new(SyncCoordinator::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let a = sync.clone();
+        let first = tokio::spawn(async move {
+            a.run(|| async {
+                let _ = started_tx.send(());
+                let _ = done_rx.await;
+                Ok(PricingSyncResult {
+                    last_success_ms: 9,
+                    catalog_stamp: "set".into(),
+                })
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        let b = sync.clone();
+        let second =
+            tokio::spawn(async move { b.run(|| async { panic!("duplicate download") }).await });
+        tokio::task::yield_now().await;
+        done_tx.send(()).unwrap();
+        assert_eq!(
+            first.await.unwrap().unwrap(),
+            second.await.unwrap().unwrap()
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let a = sync.clone();
+        let cancelled = tokio::spawn(async move {
+            a.run(|| async {
+                let _ = started_tx.send(());
+                std::future::pending().await
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        let b = sync.clone();
+        let waiter =
+            tokio::spawn(async move { b.run(|| async { panic!("cancelled duplicate") }).await });
+        tokio::task::yield_now().await;
+        cancelled.abort();
+        assert!(waiter.await.unwrap().unwrap_err().contains("cancel"));
+        assert!(sync
+            .run(|| async {
+                Ok(PricingSyncResult {
+                    last_success_ms: 10,
+                    catalog_stamp: "retry".into(),
+                })
+            })
+            .await
+            .is_ok());
+    }
+    #[tokio::test]
+    async fn bundle_restart_never_loads_a_half_set() {
+        let root = std::env::temp_dir().join(format!("pane-price-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("catalogs.json");
+        let old = bundle(1., 100).await;
+        write_bundle(&path, &old).unwrap();
+        std::fs::write(root.join("litellm.json"), "{\"partial\":true}").unwrap();
+        std::fs::write(root.join("pane.interrupted.tmp"), "partial").unwrap();
+        assert_eq!(read_bundle(&path).unwrap().last_success_ms, 100);
+        let mut incomplete = bundle(2., 200).await;
+        incomplete.catalogs.remove("supplement");
+        assert!(write_bundle(&path, &incomplete).is_err());
+        assert_eq!(
+            bundle_stamp(&read_bundle(&path).unwrap()),
+            bundle_stamp(&old)
+        );
+        let next = bundle(3., 300).await;
+        write_bundle(&path, &next).unwrap();
+        let restored = read_bundle(&path).unwrap();
+        assert_eq!(bundle_stamp(&restored), bundle_stamp(&next));
+        assert_eq!(restored.last_success_ms, 300);
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[tokio::test]
+    async fn cancelled_download_and_failed_publication_keep_previous_bundle() {
+        let root = std::env::temp_dir().join(format!("pane-price-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("catalogs.json");
+        let old = bundle(1., 100).await;
+        write_bundle(&path, &old).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let calls = AtomicUsize::new(0);
+        let operation = prepare_bundle(Some(&old), 200, |source, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if source == "modelsdev" {
+                    std::future::pending::<()>().await;
+                }
+                Ok(response(source, 2.))
+            }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), operation)
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // A filesystem failure cannot change a different already committed set.
+        let blocker = root.join("not-a-directory");
+        std::fs::write(&blocker, "blocked").unwrap();
+        assert!(write_bundle(&blocker.join("catalogs.json"), &bundle(2., 200).await).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[tokio::test]
+    async fn unknown_price_stays_unknown_and_bad_rate_rejects_the_set() {
+        let b = bundle(1., 100).await;
+        let s = validate_bundle(&b).unwrap();
+        assert_eq!(resolve(&s, "never-in-a-catalog-fixture", 0), None);
+        for rate in [-1., 10_001.] {
+            assert!(
+                prepare_bundle(None, 100, |source, _| std::future::ready(Ok(response(
+                    source, rate
+                ))))
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reprice_changes_cost_not_tokens_and_keeps_cursor_authoritative_charges() {
+        let root = providers::config_dir().join("manual-reprice-logs");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let raw=serde_json::json!({"type":"assistant","timestamp":chrono::Utc::now().to_rfc3339(),"requestId":"fixture-price-request","message":{"id":"fixture-price-message","model":"fixture-priced-model","usage":{"input_tokens":1000000.,"output_tokens":0}}}).to_string()+"\n";
+        let path = root.join("session.jsonl");
+        std::fs::write(&path, &raw).unwrap();
+        let policy = crate::scan_policy::ScanPolicy::new(
+            [("claude".into(), vec![root.clone()])]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap()
+        .with_epochs(
+            [("claude".into(), "price-fixture-grant".into())]
+                .into_iter()
+                .collect(),
+        );
+        let calls = AtomicUsize::new(0);
+        let csv = format!(
+            "Date,Model,Cost,Total Tokens\n{},fixture-priced-model,12.34,1000000\n",
+            chrono::Utc::now().to_rfc3339()
+        );
+        let cursor_before = serde_json::to_value(crate::spend::cursor_from_csv(&csv)).unwrap();
+        let mut previous_stamp = String::new();
+        for rate in [1., 2., 2., 3.] {
+            let success = sync_with(|source, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(response(source, rate)))
+            })
+            .await
+            .unwrap();
+            let rows = crate::spend::collect(&policy, None);
+            assert_eq!(
+                rows.iter().map(|r| r.last30.tokens).sum::<f64>(),
+                1_000_000.
+            );
+            assert_eq!(rows.iter().map(|r| r.last30.cost).sum::<f64>(), rate);
+            assert_eq!(
+                serde_json::to_value(crate::spend::cursor_from_csv(&csv)).unwrap(),
+                cursor_before
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+            let saved: Value = serde_json::from_str(
+                &std::fs::read_to_string(providers::config_dir().join("spend_cache.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved["pricing_stamp"], success.catalog_stamp);
+            assert_eq!(saved["scan_epochs"]["claude"], "price-fixture-grant");
+            previous_stamp = success.catalog_stamp;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 12);
+        let last = status();
+        assert_eq!(last.catalog_stamp, previous_stamp);
+        assert!(
+            sync_with(|_, _| std::future::ready(Err("fixture offline".into())))
+                .await
+                .is_err()
+        );
+        assert_eq!(status(), last);
+        assert_eq!(
+            crate::spend::collect(&policy, None)
+                .iter()
+                .map(|r| r.last30.cost)
+                .sum::<f64>(),
+            3.
+        );
+
+        // Cancel after every download is ready but while an existing scan owns
+        // the commit lock. Neither disk, in-memory prices, nor time can change.
+        let before = std::fs::read(dir().join("catalogs.json")).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || loop {
+            if crate::spend::try_pricing_commit(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .is_some()
+            {
+                break;
+            }
+            std::thread::yield_now();
+        });
+        entered_rx.recv().unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            sync_with(|source, _| std::future::ready(Ok(response(source, 9.))))
+        )
+        .await
+        .is_err());
+        assert_eq!(status(), last);
+        assert_eq!(std::fs::read(dir().join("catalogs.json")).unwrap(), before);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let candidate = bundle(10., 1000).await;
+        let candidate_store = validate_bundle(&candidate).unwrap();
+        let candidate_result = PricingSyncResult {
+            last_success_ms: 1000,
+            catalog_stamp: bundle_stamp(&candidate),
+        };
+        assert!(commit_catalogs(candidate_store, candidate_result, || Err(
+            "synthetic disk full".into()
+        ))
+        .is_err());
+        assert_eq!(status(), last);
+        assert_eq!(std::fs::read(dir().join("catalogs.json")).unwrap(), before);
+        for source in ["litellm", "modelsdev", "supplement"] {
+            let mut candidate = bundle(5., 1000).await;
+            let doc = &mut candidate.catalogs.get_mut(source).unwrap().document;
+            match source {
+                "litellm" => {
+                    doc["bad-model"] =
+                        json!({"input_cost_per_token":"broken","output_cost_per_token":0.000001})
+                }
+                "modelsdev" => {
+                    doc["bad-provider"] =
+                        json!({"models":{"fixture-priced-model":{"cost":{"input":-1,"output":1}}}})
+                }
+                _ => {
+                    doc["pricing"]["bad-model"] =
+                        json!({"input_per_million":-1,"output_per_million":1})
+                }
+            }
+            assert!(sync_with(|name, _| std::future::ready(Ok(Download::Body(
+                candidate.catalogs[name].document.to_string(),
+                "changed-etag".into()
+            ))))
+            .await
+            .is_err());
+            assert_eq!(status(), last, "{source} changed the last-success status");
+            assert_eq!(
+                std::fs::read(dir().join("catalogs.json")).unwrap(),
+                before,
+                "{source} changed the saved bundle"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[tokio::test]
+    async fn invalid_advertised_rate_cannot_hide_behind_valid_survivors() {
+        for source in ["litellm", "modelsdev", "supplement"] {
+            for invalid in [json!(-1), json!("broken"), json!(10001)] {
+                let mut candidate = bundle(1., 100).await;
+                let doc = &mut candidate.catalogs.get_mut(source).unwrap().document;
+                match source {
+                    "litellm" => {
+                        doc["bad-model"] =
+                            json!({"input_cost_per_token":invalid,"output_cost_per_token":0.000001})
+                    }
+                    "modelsdev" => {
+                        doc["bad-provider"] = json!({"models":{"fixture-priced-model":{"cost":{"input":invalid,"output":1}}}})
+                    }
+                    _ => {
+                        doc["pricing"]["bad-model"] =
+                            json!({"input_per_million":invalid,"output_per_million":1})
+                    }
+                }
+                assert!(
+                    validate_bundle(&candidate).is_err(),
+                    "{source} malformed price was silently omitted"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_unknown_and_explicit_zero_prices_are_distinct() {
+        let mut candidate = bundle(1., 100).await;
+        let lite = &mut candidate.catalogs.get_mut("litellm").unwrap().document;
+        lite["sample_spec"] =
+            json!({"input_cost_per_token":"float","output_cost_per_token":"float"});
+        lite["metadata"] = json!({"description":"catalog metadata"});
+        lite["unknown-model"] = json!({"max_tokens":8192});
+        lite["input-only-embedding"] = json!({"input_cost_per_token":0.0000001,"mode":"embedding"});
+        lite["zero-model"] = json!({"input_cost_per_token":0,"output_cost_per_token":0});
+        let md = &mut candidate.catalogs.get_mut("modelsdev").unwrap().document;
+        md["metadata"] = json!({"name":"metadata"});
+        md["extra"] = json!({"models":{"unknown-model":{"name":"Unknown"},"zero-model":{"cost":{"input":0,"output":0}}}});
+        let sup = &mut candidate.catalogs.get_mut("supplement").unwrap().document;
+        sup["notes"] = json!("public metadata");
+        sup["pricing"]["unknown-model"] = json!({"note":"rate not published"});
+        sup["pricing"]["zero-model"] = json!({"input_per_million":0,"output_per_million":0});
+        let parsed = validate_bundle(&candidate).unwrap();
+        assert_eq!(resolve(&parsed, "unknown-model", 0), None);
+        assert_eq!(
+            resolve(&parsed, "zero-model", 0),
+            Some(Price::flat(0., 0., 0., 0.))
+        );
+        assert!(!parsed.litellm.contains_key("sample_spec"));
+        for (source, key) in [
+            ("litellm", "cache_read_input_token_cost"),
+            ("modelsdev", "cache_read"),
+            ("supplement", "cache_read_per_million"),
+        ] {
+            let mut broken = candidate.clone();
+            let doc = &mut broken.catalogs.get_mut(source).unwrap().document;
+            match source {
+                "litellm" => doc["fixture-priced-model"][key] = json!("bad"),
+                "modelsdev" => {
+                    doc["fixture"]["models"]["fixture-priced-model"]["cost"][key] = json!("bad")
+                }
+                _ => doc["pricing"]["fixture-priced-model"][key] = json!("bad"),
+            }
+            assert!(
+                validate_bundle(&broken).is_err(),
+                "{source} silently replaced malformed optional rate"
+            );
+        }
+    }
+}

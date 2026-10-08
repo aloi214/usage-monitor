@@ -1,0 +1,773 @@
+use super::{http, Metric, ResetCredit, Snapshot};
+use base64::Engine;
+use chrono::Utc;
+use serde::Serialize;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+
+// Codex CLI's public OAuth client id.
+const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const ID: &str = "codex";
+const NAME: &str = "Codex";
+const MAX_CRED_BYTES: u64 = 64 * 1024;
+
+pub(crate) fn default_home() -> PathBuf {
+    std::env::var("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".codex"))
+}
+
+/// One discovered Codex login. Mirrors the Claude account model (and
+/// upstream OpenUsage's Phase 5a design): the default CODEX_HOME keeps the
+/// bare "codex" id; extras mint "codex@<hash8>" from the account id.
+pub struct CodexAccount {
+    pub id: String,
+    /// The full account id from auth.json — attribution compares this,
+    /// never the truncated card id (hash8 prefixes can collide).
+    pub account_id: String,
+    pub name: String,
+    pub dir: PathBuf,
+}
+
+/// The account identity in a Codex home, under upstream's strict rule: a
+/// credential file that can't name its account (tokens.account_id, else
+/// the id_token's ChatGPT account claim) never becomes a card. The email
+/// claim doubles as the card label.
+fn dir_identity(dir: &std::path::Path) -> Option<(String, Option<String>)> {
+    identity_from(&read_auth(dir)?)
+}
+
+fn read_auth(dir: &std::path::Path) -> Option<Value> {
+    let raw = super::read_small_text(&dir.join("auth.json"), MAX_CRED_BYTES, "auth.json").ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Proof a discovered auth.json actually belongs to OpenAI: its id_token
+/// carries OpenAI's own claim namespace. `auth.json` + `tokens.account_id`
+/// is not an OpenAI-specific shape — broad scanning could otherwise
+/// misclassify another tool's credential file as a Codex login and send
+/// its tokens to OpenAI endpoints (refresh could even write back into it).
+fn openai_provenance(doc: &Value) -> bool {
+    doc.pointer("/tokens/id_token")
+        .and_then(Value::as_str)
+        .and_then(jwt_claims)
+        .is_some_and(|c| c.get("https://api.openai.com/auth").is_some())
+}
+
+/// (account id, email label) from a parsed auth.json: tokens.account_id
+/// first, the id_token's ChatGPT account claim as the fallback; a file
+/// that names neither has no identity and never becomes a card.
+fn identity_from(doc: &Value) -> Option<(String, Option<String>)> {
+    let tokens = doc.get("tokens")?;
+    let claims = tokens
+        .get("id_token")
+        .and_then(Value::as_str)
+        .and_then(jwt_claims);
+    let account_id = tokens
+        .get("account_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            claims
+                .as_ref()?
+                .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })?;
+    let email = claims
+        .as_ref()
+        .and_then(|c| c.get("email"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    Some((account_id, email))
+}
+
+/// Revalidate only remembered, individually enabled account directories.
+/// Default-account credentials are never opened merely to deduplicate extras.
+pub fn discover_extra_accounts() -> Vec<CodexAccount> {
+    discover_extra_accounts_for(&crate::access_runtime().snapshot().0)
+}
+
+pub(crate) fn discover_extra_accounts_for(policy: &crate::access_policy::AccessPolicy) -> Vec<CodexAccount> {
+    policy.account_bindings.iter()
+        .filter(|(id, binding)| binding.family == "codex" && policy.allows_account(id) && crate::access_runtime().snapshot().0.allows_account(id))
+        .filter_map(|(id, binding)| account_at_directory(&binding.directory).filter(|a| &a.id == id))
+        .collect()
+}
+
+/// Called only after explicit one-directory discovery consent, or for a
+/// remembered account whose individual grant is still active.
+pub(crate) fn account_at_directory(dir: &Path) -> Option<CodexAccount> {
+    if default_home().canonicalize().ok().as_deref() == Some(dir) { return None; }
+    crate::access_policy::contained_file(dir, "auth.json").ok()?;
+    let doc = read_auth(dir)?;
+    if !openai_provenance(&doc) { return None; }
+    let (account_id, email) = identity_from(&doc)?;
+    if !scoped_id_charset(&account_id) { return None; }
+    let id = card_id_of(&account_id);
+    let name = email.map(|e| format!("Codex — {e}")).unwrap_or_else(|| id.clone());
+    Some(CodexAccount { id, account_id, name, dir: dir.to_path_buf() })
+}
+
+/// The card id an account id maps to — "codex@<hash8>". Shared by
+/// discovery and Orca-home attribution so both derive it the same way.
+pub(crate) fn card_id_of(account_id: &str) -> String {
+    let hash8: String = account_id.chars().filter(|c| *c != '-').take(8).collect();
+    format!("codex@{hash8}")
+}
+
+/// The default login's account identity, for the snapshot-cache stamp.
+pub fn default_identity() -> Option<String> {
+    if !crate::access_runtime().snapshot().0.allows_account(ID) { return None; }
+    dir_identity(&default_home()).map(|(a, _)| a)
+}
+
+/// Just the account id in a home's auth.json — a read-only attribution
+/// lookup for the spend scan; the credential never enters a token path.
+pub(crate) fn home_account_id(dir: &Path) -> Option<String> {
+    dir_identity(dir).map(|(a, _)| a)
+}
+
+/// A Codex home managed by Orca (stablyai/orca): Orca launches Codex with
+/// its own CODEX_HOME, so these sessions never land in `~/.codex`.
+pub struct OrcaHome {
+    pub dir: PathBuf,
+    pub kind: OrcaKind,
+}
+
+pub enum OrcaKind {
+    /// Mirror of the system-default account.
+    Runtime,
+    /// One Orca-managed extra login at codex-accounts/<id>/home.
+    Account,
+}
+
+/// Orca's config roots: `<config_dir>/orca` (`%APPDATA%\orca` on Windows,
+/// `~/.config/orca` on Linux, `~/Library/Application Support/orca` on
+/// macOS — where a capitalized `Orca` also shows up).
+fn orca_config_roots() -> Vec<PathBuf> {
+    let Some(cfg) = dirs::config_dir() else {
+        return Vec::new();
+    };
+    #[cfg(windows)]
+    let roots = vec![cfg.join("orca")];
+    #[cfg(not(windows))]
+    let roots = vec![cfg.join("orca"), cfg.join("Orca")];
+    roots
+}
+
+/// Every Codex home Orca manages: the system-default runtime home first,
+/// then each extra account's home (sorted for stable scan priority).
+/// Session logs only are read from these — the runtimes own the
+/// credentials inside, so they never become cards or token sources.
+pub fn orca_codex_homes() -> Vec<OrcaHome> {
+    let mut out = Vec::new();
+    for root in orca_config_roots() {
+        out.extend(orca_codex_homes_in(&root));
+    }
+    out
+}
+
+fn orca_codex_homes_in(root: &Path) -> Vec<OrcaHome> {
+    let mut out = Vec::new();
+    let runtime = root.join("codex-runtime-home").join("home");
+    if runtime.is_dir() {
+        out.push(OrcaHome {
+            dir: runtime,
+            kind: OrcaKind::Runtime,
+        });
+    }
+    let mut account_homes: Vec<PathBuf> = std::fs::read_dir(root.join("codex-accounts"))
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path().join("home"))
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    account_homes.sort();
+    out.extend(account_homes.into_iter().map(|dir| OrcaHome {
+        dir,
+        kind: OrcaKind::Account,
+    }));
+    out
+}
+
+/// Access tokens are JWTs: three base64 chunks separated by dots. The middle
+/// chunk is a JSON object with the expiry time and plan info.
+fn jwt_claims(token: &str) -> Option<Value> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub async fn snapshot() -> Snapshot {
+    snapshot_at(default_home(), ID.to_string(), NAME.to_string()).await
+}
+
+/// Snapshot for one account's Codex home — the default card and every
+/// discovered extra account run the same flow scoped to their dir.
+pub async fn snapshot_at(dir: PathBuf, id: String, name: String) -> Snapshot {
+    match fetch(&dir, &id, &name).await {
+        Ok(s) => s,
+        Err(e) => Snapshot::error(&id, &name, e),
+    }
+}
+
+struct Access {
+    token: String,
+    account_id: String,
+    plan: Option<String>,
+}
+
+/// Loads (and if needed refreshes + writes back) the Codex OAuth access
+/// token. Shared by the usage fetch and the reset-credit redeem command.
+async fn load_access(dir: &std::path::Path) -> Result<Access, String> {
+    use crate::credential_refresh::{codex_identity, refresh_file, Flavor, Reason, RemoteError};
+    let result=refresh_file(&dir.join("auth.json"),Flavor::Codex,Reason::Expiry,
+        crate::access_policy::check_current_operation,
+        |doc| crate::credential_refresh::check_bound_directory(ID,dir,codex_identity(doc)?.as_deref()),
+        |input| async move {
+            let resp=http(ID).post("https://auth.openai.com/oauth/token")
+                .json(&json!({"client_id":CLIENT_ID,"grant_type":"refresh_token","refresh_token":input.refresh,"scope":"openid profile email"}))
+                .send().await.map_err(|_|RemoteError::Unavailable)?;
+            if !resp.status().is_success() {return Err(RemoteError::Rejected);}
+            super::json_body(resp,16*1024,"token refresh").await.map_err(|_|RemoteError::SucceededInvalid)
+        }).await?;
+    let tokens = &result.doc["tokens"];
+    let token = tokens
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("Codex access token is missing")?
+        .to_string();
+    let account_id = codex_identity(&result.doc)?.unwrap_or_default();
+    let plan = tokens
+        .get("id_token")
+        .and_then(Value::as_str)
+        .and_then(jwt_claims)
+        .and_then(|v| {
+            v.get("https://api.openai.com/auth")
+                .and_then(|v| v.get("chatgpt_plan_type"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    Ok(Access {
+        token,
+        account_id,
+        plan,
+    })
+}
+
+async fn fetch(dir: &std::path::Path, id: &str, name: &str) -> Result<Snapshot, String> {
+    if !dir.join("auth.json").exists() {
+        return Ok(Snapshot::no_credentials(
+            id,
+            name,
+            "Codex sign-in not found. Run `codex login` in a terminal.",
+        ));
+    }
+    let auth = load_access(dir).await?;
+    let (access, account_id) = (auth.token, auth.account_id);
+    let mut plan = auth.plan;
+
+    let mut req = http(ID)
+        .get("https://chatgpt.com/backend-api/wham/usage")
+        .bearer_auth(&access);
+    if !account_id.is_empty() {
+        req = req.header("chatgpt-account-id", &account_id);
+    }
+    let resp = req.send().await.map_err(|e| format!("usage request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("usage endpoint: HTTP {}", resp.status()));
+    }
+    let usage: Value = resp.json().await.map_err(|e| format!("usage parse: {e}"))?;
+
+    let mut metrics = Vec::new();
+    let rate_limits = usage
+        .get("rate_limit")
+        .or_else(|| usage.get("rate_limits"))
+        .unwrap_or(&usage);
+    push_window(
+        &mut metrics,
+        rate_limits.get("primary_window").or_else(|| rate_limits.get("primary")),
+        "Session",
+    );
+    push_window(
+        &mut metrics,
+        rate_limits.get("secondary_window").or_else(|| rate_limits.get("secondary")),
+        "Weekly",
+    );
+    // Spark (a separate metered model family) lives in additional_rate_limits;
+    // only the spark entry is shown, matching the Mac app.
+    if let Some(extra_limits) = usage.get("additional_rate_limits").and_then(Value::as_array) {
+        let spark = extra_limits.iter().find(|e| {
+            ["limit_name", "metered_feature"].iter().any(|k| {
+                e.get(*k)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.to_lowercase().contains("spark"))
+            })
+        });
+        if let Some(entry) = spark {
+            let rl = entry.get("rate_limit").unwrap_or(entry);
+            push_window_labeled(&mut metrics, rl.get("primary_window"), "Spark");
+            push_window_labeled(&mut metrics, rl.get("secondary_window"), "Spark Weekly");
+        }
+    }
+
+    // Extra Usage: pay-as-you-go credit balance ($0.04 per credit). A
+    // positive balance gets a plan-style meter against the highest balance
+    // seen (a top-up raises it, same mechanism as Moonshot/DeepSeek); a
+    // spent balance still reads "$0.00 · 0 credits" — that's information,
+    // not noise.
+    // The same serializer that quotes the balance may quote this flag.
+    let unlimited = usage
+        .pointer("/credits/unlimited")
+        .is_some_and(|v| v.as_bool() == Some(true) || v.as_str().map(str::trim) == Some("true"));
+    if unlimited {
+        metrics.push(Metric::text("Extra credits", "Unlimited".into()));
+    } else if let Some(credits) = credits_balance(&usage) {
+        if credits > 0.0 {
+            let dollars = credits * 0.04;
+            let suffix = format!(" · {credits:.0} credits");
+            // High-water baseline keyed per CARD, not per family — two
+            // accounts' balances must never share one baseline.
+            let meter_key = format!("{id}-extra");
+            match super::credit_meter_labeled(&meter_key, "$", dollars, "Extra credits", &suffix)
+            {
+                Some(m) => metrics.push(m),
+                None => metrics.push(Metric::text(
+                    "Extra credits",
+                    format!("${dollars:.2}{suffix}"),
+                )),
+            }
+        } else {
+            metrics.push(Metric::text("Extra usage", "$0.00 · 0 credits".into()));
+        }
+    }
+
+    // One resets row for all banked credits: per-credit expiries from the
+    // dedicated endpoint when it answers (empty included — "0 available"
+    // still opens the empty-state popover), else the usage body's bare
+    // count without expiries.
+    match fetch_reset_credits(&access, &account_id).await {
+        Some(credits) => metrics.push(Metric::resets(
+            credits.len(),
+            Some(
+                credits
+                    .iter()
+                    .map(|(id, exp)| ResetCredit {
+                        id: Some(id.clone()),
+                        expires_at: *exp,
+                    })
+                    .collect(),
+            ),
+        )),
+        None => {
+            if let Some(count) = usage
+                .pointer("/rate_limit_reset_credits/available_count")
+                .and_then(Value::as_i64)
+            {
+                if count >= 0 {
+                    metrics.push(Metric::resets(count as usize, None));
+                }
+            }
+        }
+    }
+    if plan.is_none() {
+        plan = usage
+            .get("plan_type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    if metrics.is_empty() {
+        return Err("usage response had no recognizable rate limits".into());
+    }
+    Ok(Snapshot::ok(id, name, plan, metrics))
+}
+
+/// The credit balance from the usage body. The API serializes it
+/// inconsistently — a JSON number in some responses, a quoted string in
+/// others (rollout logs show `"balance":"0"`) — so both spellings parse.
+/// A missing balance with `has_credits: false` reads as an explicit zero.
+fn credits_balance(usage: &Value) -> Option<f64> {
+    usage
+        .pointer("/credits/balance")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+        .map(|b| b.floor().max(0.0))
+        .or_else(|| {
+            (usage.pointer("/credits/has_credits").and_then(Value::as_bool) == Some(false))
+                .then_some(0.0)
+        })
+}
+
+const CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+
+/// Epoch seconds, epoch ms, or RFC3339 → epoch ms.
+fn parse_expiry_ms(v: Option<&Value>) -> Option<i64> {
+    match v? {
+        Value::Number(n) => {
+            let n = n.as_i64()?;
+            Some(if n < 1_000_000_000_000 { n * 1000 } else { n })
+        }
+        Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|d| d.timestamp_millis()),
+        _ => None,
+    }
+}
+
+/// Best-effort: still-available credits as (id, expires_at ms), soonest
+/// expiry first. The extra headers mirror the Codex desktop client.
+async fn fetch_reset_credits(access: &str, account_id: &str) -> Option<Vec<(String, Option<i64>)>> {
+    let mut req = http(ID)
+        .get(CREDITS_URL)
+        .bearer_auth(access)
+        .header("Accept", "application/json")
+        .header("OpenAI-Beta", "codex-1")
+        .header("originator", "Codex Desktop");
+    if !account_id.is_empty() {
+        req = req.header("chatgpt-account-id", account_id);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let doc: Value = resp.json().await.ok()?;
+    let credits = doc.get("credits").and_then(Value::as_array)?;
+    let mut out: Vec<(String, Option<i64>)> = credits
+        .iter()
+        .filter(|c| match c.get("status").and_then(Value::as_str) {
+            // Some tenants omit status even when available_count says credits exist.
+            Some(s) => s.eq_ignore_ascii_case("available"),
+            None => true,
+        })
+        .filter_map(|c| {
+            let id = c
+                .get("id")
+                .or_else(|| c.get("credit_id"))
+                .and_then(Value::as_str)?
+                .to_string();
+            Some((id, parse_expiry_ms(c.get("expires_at"))))
+        })
+        .collect();
+    out.sort_by_key(|(_, e)| e.unwrap_or(i64::MAX));
+    Some(out)
+}
+
+/// What one consume call settled into — the footer shows `message`, the
+/// popover picks its banner off `outcome`.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct RedeemOutcome {
+    /// "success" | "nothing_to_reset" | "no_credit"
+    pub outcome: &'static str,
+    /// Footer status line.
+    pub message: String,
+    pub windows_reset: i64,
+}
+
+/// Consume answers HTTP 200 with a `code` field — the status alone can't
+/// distinguish a spent credit from a refusal that kept it.
+fn redeem_outcome(status: reqwest::StatusCode, body: &Value) -> Result<RedeemOutcome, String> {
+    if !status.is_success() {
+        let msg = body
+            .get("detail")
+            .and_then(Value::as_str)
+            .or_else(|| body.get("error").and_then(Value::as_str))
+            .unwrap_or("request failed");
+        return Err(format!("HTTP {status}: {msg}"));
+    }
+    let windows_reset = body.get("windows_reset").and_then(Value::as_i64).unwrap_or(0);
+    let success = || RedeemOutcome {
+        outcome: "success",
+        message: if windows_reset > 0 {
+            format!(
+                "Codex limits reset ({windows_reset} window{})",
+                if windows_reset == 1 { "" } else { "s" }
+            )
+        } else {
+            "Reset credit redeemed".to_string()
+        },
+        windows_reset,
+    };
+    match body.get("code").and_then(Value::as_str) {
+        // already_redeemed is the idempotency-key retry landing — the credit
+        // was spent (by us, earlier), which for the UI is a success.
+        Some("reset") | Some("already_redeemed") => Ok(success()),
+        Some("nothing_to_reset") => Ok(RedeemOutcome {
+            outcome: "nothing_to_reset",
+            message: "Your usage doesn't need a reset yet".into(),
+            windows_reset,
+        }),
+        Some("no_credit") => Ok(RedeemOutcome {
+            outcome: "no_credit",
+            message: "That reset is no longer available".into(),
+            windows_reset,
+        }),
+        // Older response shape carried no code; windows_reset > 0 is the
+        // only success signal it has.
+        _ if windows_reset > 0 => Ok(success()),
+        _ => Err("unexpected consume response".into()),
+    }
+}
+
+/// Consumes one banked reset credit — irreversible; the UI confirms first.
+/// POST /consume with an idempotency key: the frontend mints one per credit
+/// when its confirm card opens and reuses it on retries, so a retried claim
+/// can't double-spend (the server answers already_redeemed → success).
+/// `redeem_request_id` None mints the current openusage-{ts}-{pid} key.
+pub async fn redeem_credit(
+    provider_id: &str,
+    credit_id: &str,
+    redeem_request_id: Option<String>,
+) -> Result<RedeemOutcome, String> {
+    // Route the redeem to the account whose card offered the credit — an
+    // extra account's Use button must spend ITS credit, not the default
+    // login's (upstream's CodexResetClaimRouter, in one lookup).
+    let dir = if provider_id == ID {
+        default_home()
+    } else {
+        crate::access_policy::current_operation()
+            .filter(|permit| permit.account_id() == provider_id)
+            .and_then(|permit| permit.read_bound_target("codex", |id, binding| {
+                account_at_directory(&binding.directory).filter(|account| account.id == id).map(|account| account.dir)
+            }))
+            .ok_or_else(|| format!("Unknown or disabled codex account: {provider_id}"))?
+    };
+    let auth = load_access(&dir).await?;
+    let redeem_request_id = redeem_request_id.unwrap_or_else(|| {
+        format!(
+            "openusage-{}-{}",
+            Utc::now().timestamp_millis(),
+            std::process::id()
+        )
+    });
+    let mut req = http(ID)
+        .post(format!("{CREDITS_URL}/consume"))
+        .bearer_auth(&auth.token)
+        .header("Accept", "application/json")
+        .header("OpenAI-Beta", "codex-1")
+        .header("originator", "Codex Desktop")
+        .json(&json!({ "credit_id": credit_id, "redeem_request_id": redeem_request_id }));
+    if !auth.account_id.is_empty() {
+        req = req.header("chatgpt-account-id", &auth.account_id);
+    }
+    let resp = req.send().await.map_err(|e| format!("consume request: {e}"))?;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    redeem_outcome(status, &body)
+}
+
+fn push_window(metrics: &mut Vec<Metric>, node: Option<&Value>, fallback_label: &str) {
+    push_window_inner(metrics, node, fallback_label, false);
+}
+
+/// Like push_window but keeps the given label (Spark rows must not be
+/// auto-renamed to Session/Weekly by window length).
+fn push_window_labeled(metrics: &mut Vec<Metric>, node: Option<&Value>, label: &str) {
+    push_window_inner(metrics, node, label, true);
+}
+
+fn push_window_inner(metrics: &mut Vec<Metric>, node: Option<&Value>, label_in: &str, forced: bool) {
+    let Some(node) = node else { return };
+    let Some(used) = node.get("used_percent").and_then(Value::as_f64) else { return };
+    let window_seconds = node
+        .get("limit_window_seconds")
+        .and_then(Value::as_i64)
+        .or_else(|| node.get("window_minutes").and_then(Value::as_i64).map(|m| m * 60));
+    let label = if forced {
+        label_in
+    } else {
+        match window_seconds {
+            Some(s) if s > 21_600 => "Weekly", // longer than 6 hours
+            Some(_) => "Session",
+            None => label_in,
+        }
+    };
+    let period_ms = window_seconds
+        .map(|s| s * 1000)
+        .unwrap_or(if label.contains("Weekly") { 7 * 86_400_000 } else { 5 * 3_600_000 });
+    let now_ms = Utc::now().timestamp_millis();
+    let resets_at = node
+        .get("reset_at")
+        .and_then(Value::as_i64)
+        .map(|s| if s < 1_000_000_000_000 { s * 1000 } else { s })
+        .or_else(|| {
+            node.get("reset_after_seconds")
+                .or_else(|| node.get("resets_in_seconds"))
+                .and_then(Value::as_i64)
+                .map(|s| now_ms + s * 1000)
+        });
+    // Percentages show as Codex reports them (it floors to whole percents,
+    // so an untouched window can read 1%) — the Mac dropped its old ≤1%→0
+    // normalization because it masked real early usage; near-empty windows
+    // are kept calm on the pacing side instead.
+    metrics.push(Metric::progress(label, used, None).with_reset(resets_at, Some(period_ms)));
+}
+
+/// The account id becomes `codex@<hash8>`, which the frontend interpolates
+/// into HTML attributes — only [A-Za-z0-9-] is safe there.
+fn scoped_id_charset(raw: &str) -> bool {
+    !raw.is_empty() && raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn is_regular_file(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|m| m.is_file() && !m.file_type().is_symlink())
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        credits_balance, identity_from, openai_provenance, orca_codex_homes_in, redeem_outcome,
+        scoped_id_charset, OrcaKind,
+    };
+    use base64::Engine;
+    use serde_json::json;
+
+    fn fake_id_token(claims: serde_json::Value) -> String {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        format!("x.{payload}.y")
+    }
+
+    #[test]
+    fn provenance_requires_openais_claim_namespace() {
+        // A foreign auth.json with the right field SHAPE but no OpenAI
+        // claim — the misclassification case — must not pass.
+        let foreign = json!({"tokens": {"account_id": "some-other-account",
+            "access_token": "foreign-access", "refresh_token": "foreign-refresh"}});
+        assert!(!openai_provenance(&foreign));
+        // Even with a JWT id_token, foreign claims don't count.
+        let foreign_jwt = json!({"tokens": {"account_id": "acct",
+            "id_token": fake_id_token(json!({"iss": "https://example.com"}))}});
+        assert!(!openai_provenance(&foreign_jwt));
+        // A real Codex login carries OpenAI's claim namespace.
+        let real = json!({"tokens": {"account_id": "acct",
+            "id_token": fake_id_token(json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": "acct"}}))}});
+        assert!(openai_provenance(&real));
+        assert!(!openai_provenance(&json!({})));
+    }
+
+    #[test]
+    fn codex_identity_extraction() {
+        // account_id field wins; email claim labels the card.
+        let direct = json!({"tokens": {"account_id": "acct-1",
+            "id_token": fake_id_token(json!({"email": "e@corp.com"}))}});
+        assert_eq!(identity_from(&direct), Some(("acct-1".into(), Some("e@corp.com".into()))));
+        // Empty account_id falls through to the id_token's ChatGPT claim.
+        let via_claim = json!({"tokens": {"account_id": "",
+            "id_token": fake_id_token(json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": "acct-2"}}))}});
+        assert_eq!(identity_from(&via_claim), Some(("acct-2".into(), None)));
+        // Neither → no identity → no card.
+        let anonymous = json!({"tokens": {"access_token": "k"}});
+        assert_eq!(identity_from(&anonymous), None);
+        assert_eq!(identity_from(&json!({})), None);
+    }
+
+    #[test]
+    fn orca_homes_discovery_finds_runtime_and_accounts() {
+        let root = std::env::temp_dir().join(format!("pane-orca-disc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("codex-runtime-home/home")).unwrap();
+        std::fs::create_dir_all(root.join("codex-accounts/work/home")).unwrap();
+        std::fs::create_dir_all(root.join("codex-accounts/personal/home")).unwrap();
+        // An account dir without a home/ inside is skipped.
+        std::fs::create_dir_all(root.join("codex-accounts/empty")).unwrap();
+
+        let homes = orca_codex_homes_in(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(homes.len(), 3);
+        assert!(matches!(homes[0].kind, OrcaKind::Runtime));
+        assert!(homes[0].dir.ends_with(std::path::Path::new("codex-runtime-home").join("home")));
+        // Account homes come sorted for stable scan priority.
+        assert!(matches!(homes[1].kind, OrcaKind::Account));
+        assert!(homes[1].dir.ends_with(std::path::Path::new("personal").join("home")));
+        assert!(matches!(homes[2].kind, OrcaKind::Account));
+        assert!(homes[2].dir.ends_with(std::path::Path::new("work").join("home")));
+    }
+
+    #[test]
+    fn orca_homes_discovery_empty_when_no_orca_dir() {
+        let root = std::env::temp_dir().join(format!("pane-orca-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(orca_codex_homes_in(&root).is_empty());
+    }
+
+    #[test]
+    fn scoped_id_charset_is_html_attribute_safe() {
+        assert!(scoped_id_charset("b3f1c2d4-9a8b-4c5d-8e9f-aabbccddeeff"));
+        assert!(!scoped_id_charset(""));
+        assert!(!scoped_id_charset("evil\"><script>"));
+        assert!(!scoped_id_charset("with space"));
+    }
+
+    #[test]
+    fn credit_balance_parses_number_and_string_spellings() {
+        // String balance (the shape rollout logs show) — the bug that made
+        // a freshly bought balance vanish from the card entirely.
+        let s = json!({"credits": {"has_credits": true, "balance": "2500"}});
+        assert_eq!(credits_balance(&s), Some(2500.0));
+        // Number balance.
+        let n = json!({"credits": {"has_credits": true, "balance": 125.0}});
+        assert_eq!(credits_balance(&n), Some(125.0));
+        // No balance field, explicitly no credits → explicit zero row.
+        let none = json!({"credits": {"has_credits": false}});
+        assert_eq!(credits_balance(&none), Some(0.0));
+        // No credits object at all → no row.
+        assert_eq!(credits_balance(&json!({})), None);
+    }
+
+    #[test]
+    fn consume_codes_map_to_outcomes() {
+        let ok = reqwest::StatusCode::OK;
+        let reset = redeem_outcome(ok, &json!({"code": "reset", "windows_reset": 2})).unwrap();
+        assert_eq!(reset.outcome, "success");
+        assert_eq!(reset.message, "Codex limits reset (2 windows)");
+        assert_eq!(reset.windows_reset, 2);
+
+        let redeemed =
+            redeem_outcome(ok, &json!({"code": "already_redeemed", "windows_reset": 0})).unwrap();
+        assert_eq!(redeemed.outcome, "success");
+        assert_eq!(redeemed.message, "Reset credit redeemed");
+
+        let nothing = redeem_outcome(ok, &json!({"code": "nothing_to_reset"})).unwrap();
+        assert_eq!(nothing.outcome, "nothing_to_reset");
+        assert_eq!(nothing.message, "Your usage doesn't need a reset yet");
+
+        let gone = redeem_outcome(ok, &json!({"code": "no_credit"})).unwrap();
+        assert_eq!(gone.outcome, "no_credit");
+        assert_eq!(gone.message, "That reset is no longer available");
+    }
+
+    #[test]
+    fn consume_without_code_falls_back_to_windows_reset() {
+        let ok = reqwest::StatusCode::OK;
+        let older = redeem_outcome(ok, &json!({"windows_reset": 2})).unwrap();
+        assert_eq!(older.outcome, "success");
+        assert_eq!(older.windows_reset, 2);
+        // No code and nothing reset: not a success we can stand behind.
+        assert!(redeem_outcome(ok, &json!({})).is_err());
+        assert!(redeem_outcome(ok, &json!({"code": "mystery"})).is_err());
+    }
+
+    #[test]
+    fn consume_http_error_keeps_detail_message() {
+        let forbidden = reqwest::StatusCode::FORBIDDEN;
+        let err =
+            redeem_outcome(forbidden, &json!({"detail": "credit expired"})).unwrap_err();
+        assert_eq!(err, "HTTP 403 Forbidden: credit expired");
+        let err = redeem_outcome(forbidden, &json!({})).unwrap_err();
+        assert_eq!(err, "HTTP 403 Forbidden: request failed");
+    }
+}

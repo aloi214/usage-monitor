@@ -1,0 +1,12 @@
+Pane Private — per-provider automatic quota refresh, 2026-10-07
+Verified combined product code: ce8dfa96f098cf425b9c339484a372004b1b477c
+Verified backend code: 867db99f7395d1d7c14283515a4a96ac4b3fb048
+Previous source delivery: 709d5da9f8873b12e71cde37b0df85f626069ba4
+Upstream base: a55578c7b10c2ef1d136dc4decaefcaa0fb7a15e
+
+Adds independent automatic quota refresh preferences for 22 remote providers; all 23 platforms remain supported.
+Claude and CommandCode default to manual, other remote providers retain their prior automatic defaults. Permissions remain independently required.
+Manual card/global refresh remains available. Cursor remote CSV obeys its automatic setting; ordinary local log scanning and manual pricing sync remain independent.
+Start with README.zh-CN.md, docs/provider-auto-refresh.md, and docs/provider-auto-refresh-validation.md.
+Source code only, not an installer. Native Windows/WebView2, real-account compatibility, installation and package size remain unverified.
+MANIFEST.sha256 lists every packaged source file except the manifest itself.
