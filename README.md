@@ -2,11 +2,13 @@
 
 **English** · [简体中文](README.zh-CN.md) · [Русский](README.ru.md)
 
-A source-only, privacy-focused fork of [Pane for Windows](https://github.com/ItsJazii/pane), based on upstream commit `a55578c`. The desktop app uses Tauri, Rust, and TypeScript to show AI account limits and separately authorized local usage estimates.
+A privacy-focused fork of [Pane for Windows](https://github.com/ItsJazii/pane), based on upstream commit `a55578c`. The desktop app uses Tauri, Rust, and TypeScript to show AI account limits and separately authorized local usage estimates.
 
 > This repository describes **Pane Private**, not an upstream Pane release. Upstream installers, winget packages, install scripts, and release downloads do not contain these changes. The earlier source version was reported to build and render in Windows 11 development mode. The later settings, exact-account refresh, CommandCode, and per-provider auto-refresh changes still need native acceptance testing; no private Windows installer or size reduction is verified here.
 
 ## Start here
+
+- **[GitHub Windows builds and releases / 自动检查与发布](docs/github-releases.md)**: PR test installers, manual branch builds, and version-tagged Releases
 
 - **[Per-provider quota auto-refresh / 按平台自动刷新](docs/provider-auto-refresh.md)**: independent scheduling switches, shared interval, and saved/manual results
 - **[CommandCode GOAT (experimental) / 配置与限制](docs/commandcode-provider.md)**: a separately authorized local key and default-manual billing queries with optional auto-refresh; live account support is unverified
@@ -21,7 +23,7 @@ A source-only, privacy-focused fork of [Pane for Windows](https://github.com/Its
 
 ## Private-fork behavior
 
-- Upstream telemetry and automatic updates are removed. Updating this fork means reviewing and rebuilding its source.
+- Upstream telemetry and automatic updates are removed. Updates are installed manually from this repository’s reviewed Releases, when available, or by rebuilding reviewed source.
 - Account permissions start off. **Platform management** is the single place for provider/account permissions, region/connection modes, keys, and metrics/layout. A platform’s **Queries** switch permits individual account choices; it does not authorize them. Turning it off revokes that platform’s account queries and refreshes. Metric visibility only changes the display.
 - **Auto-refresh quotas** is separate from account permission and shared by each family’s extra accounts. Claude and CommandCode default off; other account-query providers default on, while all account grants still start off. Off retains applicable saved results and permits authorized card/global manual refresh. Hermes is local-only and has no quota-auto switch.
 - **Local log sources** start off and have independent per-tool switches. Choose known **Default location** paths or save exact **Custom locations**. Missing locations stay distinct from Off; invalid custom saves retain the prior grant without falling back. Local statistics need no account permission or credential discovery.
