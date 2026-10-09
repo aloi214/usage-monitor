@@ -48,7 +48,7 @@ test('Windows workflows name rice monitor installer artifacts and release title'
   assert.match(workflow,/name: rice-monitor-/);
   assert.doesNotMatch(workflow,/pane-private/);
  }
- assert.match(read('.github/workflows/release.yml'),/--title "rice monitor \$TAG"/);
+ assert.match(read('scripts/publish-release.mjs'),/name: `rice monitor \$\{tag\}`/);
 });
 
 test('renamed app shows its own 0.0.1 changelog when upgrading from the upstream version',async()=>{

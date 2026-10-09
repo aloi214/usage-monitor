@@ -17,6 +17,8 @@ jobs:
     name: Validate, test and build release
     runs-on: windows-latest
     timeout-minutes: 60
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
     steps:
       # Source-contract tests read LF-delimited snippets on every platform.
       - name: Keep source line endings consistent
@@ -33,10 +35,14 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
       - name: Require a commit already merged into main
+        id: source
         shell: pwsh
         run: |
           git merge-base --is-ancestor HEAD origin/main
           if ($LASTEXITCODE -ne 0) { throw "Release tags must point to commits on main." }
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Cannot resolve build commit." }
+          "commit=$commit" >> $env:GITHUB_OUTPUT
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: stable
@@ -48,14 +54,10 @@ jobs:
       - name: Verify packaged name and version
         shell: pwsh
         run: ./scripts/verify-windows-package.ps1
-      - name: Hash the installer
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe -File)
-          if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer." }
-          $installer = $installers[0]
-          $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $($installer.Name)" | Set-Content -Encoding ascii -Path (Join-Path $installer.DirectoryName 'SHA256SUMS')
+      - name: Normalize filename and hash the installer
+        run: node scripts/release-assets.mjs src-tauri/target/release/bundle/nsis
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rice-monitor-release
@@ -73,29 +75,26 @@ jobs:
     permissions:
       contents: write
     steps:
-      # This job does not check out or execute application code.
+      # Retrieve only reviewed publisher code at the immutable trigger SHA.
+      # Never execute scripts from the build artifact or install application dependencies.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            scripts/publish-release.mjs
+            scripts/release-assets.mjs
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: rice-monitor-release
           path: release
-      - name: Create and publish the release
-        shell: bash
-        working-directory: release
+      - name: Verify assets and resume the release by ID
+        run: node scripts/publish-release.mjs release
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-          COMMIT: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          shopt -s nullglob
-          installers=(./*-setup.exe)
-          [[ ${#installers[@]} -eq 1 ]]
-          sha256sum --check SHA256SUMS
-          # Upload while still a draft; a failed upload must not publish an empty release.
-          # Existing releases are never overwritten. See docs/github-releases.md for recovery.
-          gh release create "$TAG" "${installers[0]}" SHA256SUMS \
-            --draft --verify-tag --title "rice monitor $TAG" \
-            --notes "Windows x64 NSIS installer built from commit $COMMIT. This installer is unsigned; Windows may show Unknown Publisher or SmartScreen warnings. If WebView2 is missing, installation needs internet access. SHA256SUMS verifies download integrity, not publisher identity. This build does not enable automatic updates. Native installation and account behavior still need manual acceptance testing."
-          gh release edit "$TAG" --draft=false
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ needs.build.outputs.commit }}

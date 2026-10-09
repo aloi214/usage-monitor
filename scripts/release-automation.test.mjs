@@ -108,7 +108,9 @@ test('release build validates the stable tag and main ancestry before building',
   assert.match(build, /run: npm test/);
   assert.match(build, /run: cargo test --locked --manifest-path src-tauri\/Cargo\.toml --lib/);
   assert.match(build, /run: npm run tauri build -- --bundles nsis -- --locked/);
-  assert.match(build, /Get-FileHash .* -Algorithm SHA256/);
+  assert.match(build, /node scripts\/release-assets\.mjs src-tauri\/target\/release\/bundle\/nsis/);
+  assert.match(build, /commit: \$\{\{ steps\.source\.outputs\.commit \}\}/);
+  assert.match(build, /git rev-parse HEAD/);
   assert.match(build, /SHA256SUMS/);
   assert.match(build, /retention-days: 7/);
 });
@@ -120,12 +122,15 @@ test('release publisher only uploads verified build outputs with job-scoped writ
   assert.match(publish, /needs: build/);
   assert.match(publish, /permissions:\n\s+contents: write/);
   assert.match(publish, /uses: actions\/download-artifact@[a-f0-9]{40}/);
-  assert.match(publish, /sha256sum --check SHA256SUMS/);
+  assert.match(publish, /run: node scripts\/publish-release\.mjs release/);
+  assert.match(publish, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(publish, /persist-credentials: false/);
+  assert.match(publish, /sparse-checkout-cone-mode: false/);
+  assert.match(publish, /sparse-checkout: \|\n\s+scripts\/publish-release\.mjs\n\s+scripts\/release-assets\.mjs/);
+  assert.match(publish, /RELEASE_COMMIT: \$\{\{ needs\.build\.outputs\.commit \}\}/);
   assert.match(publish, /GH_TOKEN: \$\{\{ github\.token \}\}/);
-  assert.match(publish, /gh release create/);
-  assert.match(publish, /--draft --verify-tag/);
-  assert.match(publish, /gh release edit .* --draft=false/);
-  assert.doesNotMatch(publish, /actions\/checkout|npm |cargo |\.exe\s*$/m);
+  assert.doesNotMatch(publish, /gh release|npm |cargo |\.exe\s*$/m);
+  assert.doesNotMatch(publish, /secrets\.|pull_request_target/);
   assert.match(workflow, /cancel-in-progress: false/);
   for (const file of ['pr.yml', 'release.yml']) {
     for (const action of read(`.github/workflows/${file}`).matchAll(/uses: (\S+)/g)) {
