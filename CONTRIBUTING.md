@@ -1,6 +1,6 @@
-# Contributing to Pane Private
+# Contributing to rice monitor
 
-This repository is a private, source-only fork of Pane for Windows. Use the [private build guide](docs/private-build.md), not upstream install scripts or release binaries. The [MIT license](LICENSE) and upstream attribution must remain intact.
+This repository is a privacy-focused fork of Pane for Windows. Use the [private build guide](docs/private-build.md), not upstream install scripts or release binaries. The [MIT license](LICENSE) and upstream attribution must remain intact.
 
 ## Changes
 

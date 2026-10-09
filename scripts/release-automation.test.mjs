@@ -13,8 +13,8 @@ const fixture = (overrides = {}) => ({
   'package.json': JSON.stringify({ version: '1.2.3' }),
   'package-lock.json': JSON.stringify({ version: '1.2.3', packages: { '': { version: '1.2.3' } } }),
   'src-tauri/tauri.conf.json': JSON.stringify({ version: '1.2.3' }),
-  'src-tauri/Cargo.toml': '[package]\nname = "pane"\nversion = "1.2.3"\n',
-  'src-tauri/Cargo.lock': 'version = 4\n\n[[package]]\nname = "another"\nversion = "9.0.0"\n\n[[package]]\nname = "pane"\nversion = "1.2.3"\n',
+  'src-tauri/Cargo.toml': '[package]\nname = "rice-monitor"\nversion = "1.2.3"\n',
+  'src-tauri/Cargo.lock': 'version = 4\n\n[[package]]\nname = "another"\nversion = "9.0.0"\n\n[[package]]\nname = "rice-monitor"\nversion = "1.2.3"\n',
   ...overrides,
 });
 function check(tag, files = fixture()) {

@@ -1,3 +1,4 @@
+mod startup_cleanup;
 mod cache_fingerprint;
 mod access_policy;
 mod snapshot;
@@ -121,8 +122,8 @@ fn config_with_defaults(mut cfg: Value) -> Value {
     }
     let obj = cfg.as_object_mut().unwrap();
     // Out-of-the-box experience: 1-min refresh, pacing always visible,
-    // all three quota alerts on, dark + compact. (Autostart defaults on
-    // in setup; tray icon defaults to Auto via pinned = null.)
+    // all three quota alerts on, dark + compact.
+    // Tray icon defaults to Auto via pinned = null.
     obj.entry("refreshMinutes").or_insert(json!(1));
     obj.entry("disabled").or_insert(json!([]));
     obj.entry("pinned").or_insert(Value::Null);
@@ -235,7 +236,7 @@ async fn publish_authorized_main_tray(
         } else {
             apply_main_tray_projection(&handle, &tray_projection::MainTrayProjection {
                 icon_mode: tray_projection::MainTrayIconMode::Logo,
-                remaining_percentages: Vec::new(), tooltip: "Pane Private".into(),
+                remaining_percentages: Vec::new(), tooltip: "rice monitor".into(),
             })
         };
         let _ = sender.try_send(result);
@@ -396,10 +397,6 @@ fn get_config() -> Value {
 /// set_config drops anything else so a compromised frontend can't stash
 /// arbitrary data in the config file.
 const CONFIG_KEYS: &[&str] = &[
-    // Not seeded by config_with_defaults (the autostart plugin is the
-    // source of truth at runtime) but persisted here so setup() can apply
-    // the user's choice on launch.
-    "autostart",
     "refreshMinutes",
     "providerAutoRefresh",
     "disabled",
@@ -609,29 +606,6 @@ fn check_dir(path: String) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Start with Windows
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-fn get_autostart(app: tauri::AppHandle) -> bool {
-    use tauri_plugin_autostart::ManagerExt;
-    app.autolaunch().is_enabled().unwrap_or(false)
-}
-
-#[tauri::command]
-fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    use tauri_plugin_autostart::ManagerExt;
-    // Remember the choice so startup knows whether to re-assert it.
-    let _ = set_config_inner(json!({ "autostart": enabled }));
-    let manager = app.autolaunch();
-    if enabled {
-        manager.enable().map_err(|e| e.to_string())
-    } else {
-        manager.disable().map_err(|e| e.to_string())
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tray icon with the pinned metric drawn onto it
 // ---------------------------------------------------------------------------
 
@@ -810,7 +784,7 @@ fn apply_main_tray_projection(
         tray_projection::MainTrayIconMode::Logo => {
             let default = app
                 .default_window_icon()
-                .ok_or_else(|| "default Pane icon is unavailable".to_string())?;
+                .ok_or_else(|| "default rice monitor icon is unavailable".to_string())?;
             tray.set_icon(Some(default.clone()))
                 .map_err(|error| format!("set main tray logo: {error}"))?;
         }
@@ -847,7 +821,7 @@ fn last_main_tray() -> &'static Mutex<LastMainTray> {
     S.get_or_init(|| {
         Mutex::new(LastMainTray {
             lefts: Vec::new(),
-            tooltip: String::from("Pane"),
+            tooltip: String::from("rice monitor"),
         })
     })
 }
@@ -3389,10 +3363,6 @@ pub fn run() {
             toggle_popover(app, pos);
         }))
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
 
@@ -3417,8 +3387,6 @@ pub fn run() {
             configure_scan_source,
             check_dir,
             system_ui_locale,
-            get_autostart,
-            set_autostart,
             sync_tray_surfaces,
             open_link,
             copy_share_image,
@@ -3443,7 +3411,7 @@ pub fn run() {
 
             TrayIconBuilder::with_id("tray")
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("Pane")
+                .tooltip("rice monitor")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
@@ -3484,21 +3452,7 @@ pub fn run() {
                 eprintln!("[pane] shortcut: {e}");
             }
 
-            // Start with Windows is on by default (like the Mac app's
-            // launch-at-login) and re-asserted each launch so the registry
-            // entry follows the exe if it moves — e.g. loose exe → installed.
-            // Only an explicit "off" in Settings is respected. Skipped in dev
-            // builds so the debug exe never registers itself.
-            if !cfg!(debug_assertions) {
-                let wants_autostart = load_config()
-                    .get("autostart")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                if wants_autostart {
-                    use tauri_plugin_autostart::ManagerExt;
-                    let _ = app.autolaunch().enable();
-                }
-            }
+            startup_cleanup::remove_legacy_startup();
 
             Ok(())
         })

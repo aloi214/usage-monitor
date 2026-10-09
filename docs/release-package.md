@@ -27,7 +27,7 @@
 npm ci
 npm test
 npm run tauri build
-Get-Item .\src-tauri\target\release\pane.exe,
+Get-Item .\src-tauri\target\release\rice-monitor.exe,
   .\src-tauri\target\release\bundle\nsis\*-setup.exe |
   Select-Object Name, Length
 Get-FileHash .\src-tauri\target\release\bundle\nsis\*-setup.exe -Algorithm SHA256
@@ -39,7 +39,7 @@ NSIS 输出通常在 `src-tauri/target/release/bundle/nsis/`。上述路径假�
 
 ## 还没有测量或验证的部分
 
-**尚未完成此配置的 Windows MSVC/NSIS 安装包构建和原生安装验收，也没有可信的前后体积对比，不承诺减少多少 MB 或百分比。** 结构测试、schema 校验、前端构建、Cargo metadata 和交叉编译检查不能证明最终安装包大小、启动性能或 Windows 运行结果。
+**前身源码已通过 Windows CI 的 MSVC/NSIS 打包；当前 rice monitor 改名构建以当前 PR 检查为准。原生安装尚未验收，也没有可信的前后体积对比，不承诺减少多少 MB 或百分比。** 结构测试、schema 校验、前端构建、Cargo metadata 和交叉编译检查不能证明最终安装包大小、启动性能或 Windows 运行结果。
 
 公平比较时，用相同应用源码、锁文件、Windows 工具链、NSIS 版本、架构及签名设置构建两次：一次使用原 release 默认配置，一次使用本次自定义配置。两次都保持 NSIS-only、同样的 WebView2 模式和压缩方式；使用独立干净的 target 目录，记录主程序和安装包字节数及 SHA-256。不要在对比中同时变更功能代码。
 

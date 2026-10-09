@@ -30,7 +30,7 @@ test('tray provider registry length matches its Rust declaration',()=>{
 test('private build does not reuse the upstream installer identity',()=>{
  const cfg=JSON.parse(read('src-tauri/tauri.conf.json'));
  assert.equal(cfg.identifier,'local.pane.private');
- assert.equal(cfg.productName,'Pane Private');
+ assert.equal(cfg.productName,'rice monitor');
 });
 test('manual pinned Rust action selects a real toolchain explicitly',()=>{
  const workflow=read('.github/workflows/build.yml');

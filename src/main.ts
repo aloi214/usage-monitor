@@ -53,7 +53,7 @@ import paneIcon from "./assets/pane-icon.png?inline";
 import zaiIcon from "./assets/providers/zai.svg?raw";
 // The repo's changelog ships inside the bundle, so the "What's new" dialog
 // and the Settings changelog viewer read the exact file releases maintain.
-import changelogRaw from "../CHANGELOG.md?raw";
+import changelogRaw from "../RICE_CHANGELOG.md?raw";
 
 const PROVIDER_ICONS: Record<string, string> = {
   antigravity: antigravityIcon,
@@ -2149,7 +2149,7 @@ interface ChangelogSection {
   body: string;
 }
 
-/// CHANGELOG.md split into per-version sections, newest first. The
+/// RICE_CHANGELOG.md split into per-version sections, newest first. The
 /// "Unreleased" section is skipped — a shipped build's own notes carry its
 /// version header (release retitles Unreleased), so users only ever see
 /// released entries.
@@ -2386,7 +2386,7 @@ function presentStarPrompt(): void {
   overlay.querySelector("#star-never")!.addEventListener("click", retire);
   overlay.querySelector("#star-go")!.addEventListener("click", () => {
     void patchConfig({ starPromptDone: true }).catch(() => {});
-    void invoke("open_link", { url: "https://github.com/ItsJazii/pane" }).catch((err) => {
+    void invoke("open_link", { url: "https://github.com/aloi214/usage-monitor" }).catch((err) => {
       document.querySelector("#status")!.textContent = t("footer.openLinkFailed", { err: String(err) });
     });
     done();
@@ -4837,15 +4837,6 @@ async function initSettings(): Promise<void> {
     void patchConfig({ refreshMinutes: minutes }).then(scheduleAutoRefresh);
   });
 
-  const autostart = document.querySelector<HTMLInputElement>("#autostart")!;
-  autostart.checked = await invoke<boolean>("get_autostart");
-  autostart.addEventListener("change", () => {
-    void invoke("set_autostart", { enabled: autostart.checked }).catch((err) => {
-      document.querySelector("#status")!.textContent = t("footer.autostartFailed", { err: String(err) });
-      autostart.checked = !autostart.checked;
-    });
-  });
-
   const pacing = document.querySelector<HTMLInputElement>("#pacing")!;
   pacing.checked = config.pacingAlways;
   pacing.addEventListener("change", () => {
@@ -5032,11 +5023,6 @@ async function resetAllSettings(): Promise<void> {
     return;
   }
   try {
-    await invoke("set_autostart", { enabled: true });
-  } catch {
-    // Dev builds skip autostart; the preference is still saved below.
-  }
-  try {
     await invoke("set_shortcut", { shortcut: "" });
   } catch {
     // Invalid leftover shortcut shouldn't block the rest of the reset.
@@ -5121,8 +5107,6 @@ function syncSettingsControls(): void {
   setNum("#shortcut", config.shortcut);
   setCheck("#proxy-enabled", config.proxy?.enabled ?? false);
   setNum("#proxy-url", config.proxy?.url ?? "");
-  const autostart = document.querySelector<HTMLInputElement>("#autostart");
-  if (autostart) autostart.checked = true;
   renderScanSources();
   populatePinnedOptions();
   // Resetting toggles programmatically fires no change events — re-arm
@@ -5136,7 +5120,7 @@ function syncSettingsControls(): void {
 
 window.addEventListener("DOMContentLoaded", () => {
   const appLogo = document.querySelector<HTMLElement>("#app-logo")!;
-  appLogo.innerHTML = `<img src="${paneLogo}" alt="Pane" />`;
+  appLogo.innerHTML = `<img src="${paneLogo}" alt="rice monitor" />`;
   // Party mode, the easy way: triple-click the logo. (The Konami code
   // still works, for the culture.)
   let logoClicks = 0;

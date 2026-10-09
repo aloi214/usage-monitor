@@ -45,6 +45,9 @@ jobs:
       - run: npm run build
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
       - run: npm run tauri build -- --bundles nsis -- --locked
+      - name: Verify packaged name and version
+        shell: pwsh
+        run: ./scripts/verify-windows-package.ps1
       - name: Hash the installer
         shell: pwsh
         run: |
@@ -55,7 +58,7 @@ jobs:
           "$hash  $($installer.Name)" | Set-Content -Encoding ascii -Path (Join-Path $installer.DirectoryName 'SHA256SUMS')
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pane-private-release
+          name: rice-monitor-release
           path: |
             src-tauri/target/release/bundle/nsis/*-setup.exe
             src-tauri/target/release/bundle/nsis/SHA256SUMS
@@ -73,7 +76,7 @@ jobs:
       # This job does not check out or execute application code.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: pane-private-release
+          name: rice-monitor-release
           path: release
       - name: Create and publish the release
         shell: bash
@@ -93,6 +96,6 @@ jobs:
           # Upload while still a draft; a failed upload must not publish an empty release.
           # Existing releases are never overwritten. See docs/github-releases.md for recovery.
           gh release create "$TAG" "${installers[0]}" SHA256SUMS \
-            --draft --verify-tag --title "Pane Private $TAG" \
+            --draft --verify-tag --title "rice monitor $TAG" \
             --notes "Windows x64 NSIS installer built from commit $COMMIT. This installer is unsigned; Windows may show Unknown Publisher or SmartScreen warnings. If WebView2 is missing, installation needs internet access. SHA256SUMS verifies download integrity, not publisher identity. This build does not enable automatic updates. Native installation and account behavior still need manual acceptance testing."
           gh release edit "$TAG" --draft=false

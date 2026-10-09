@@ -20,8 +20,11 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm run tauri build -- --bundles nsis
+      - name: Verify packaged name and version
+        shell: pwsh
+        run: ./scripts/verify-windows-package.ps1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: pane-private-installer
+          name: rice-monitor-installer
           path: src-tauri/target/release/bundle/nsis/*-setup.exe
           if-no-files-found: error

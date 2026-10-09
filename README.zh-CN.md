@@ -1,10 +1,10 @@
-# Pane Private
+# rice monitor
 
 [English](README.md) · **简体中文** · [Русский](README.ru.md)
 
 这是基于 [Pane for Windows](https://github.com/ItsJazii/pane) 上游提交 `a55578c` 的隐私强化源码分支。应用使用 Tauri、Rust 和 TypeScript，在 Windows 托盘中显示 AI 账户额度，以及另行授权的本地用量估算。
 
-> **本仓库是 Pane Private，不是上游 Pane 发布版。** 上游安装脚本、winget 包和发布页安装包不包含此分支的修改。上一版源码已由使用者反馈在 Windows 11 完成开发版构建并显示界面；后续设置、单账号刷新、CommandCode 及按平台自动刷新仍待原生验收，体积优先的私有版安装包尚未验证或测量。
+> 产品现名为 **rice monitor**，自己的版本从 **0.0.1** 开始。上游安装脚本、winget 包和安装包不包含此分支修改。前身源码已通过 Windows CI 测试与 NSIS 打包；这不代表本次改名版本、原生安装、托盘交互或真实账户已经验收。请查看当前 PR 检查和[改名与升级说明](docs/rice-monitor-0.0.1.md)。
 
 ## 从这里开始
 
@@ -20,6 +20,8 @@
 - [安全说明](SECURITY.md)：安全边界与问题报告
 
 ## 私有分支的变化
+
+- 不随 Windows 登录自动启动，移除开机启动开关和重置时开启路径。只清理能核实为本应用的旧启动项；[升级说明](docs/rice-monitor-0.0.1.md)列出处理范围与限制。
 
 - 移除上游遥测和自动更新。更新需手动安装本仓库经过审阅的 Release（如已有发布），或审阅源码后重新构建。
 - 账户权限默认关闭。**平台管理**统一收纳账户权限、区域/连接模式、密钥及指标布局。平台标题行的**查询**开关只允许进一步选择账户，不会自动授权；关闭会撤销此平台全部账户查询和登录刷新。指标显隐只改变显示。
@@ -41,4 +43,4 @@
 
 另感谢 [Tauri](https://tauri.app/)、[LiteLLM](https://github.com/BerriAI/litellm)、[models.dev](https://models.dev/)、[prasen.dev](https://www.prasen.dev/) 和 [shadcn/ui](https://ui.shadcn.com/) 为上游提供的组件、数据和视觉技术。服务商名称及标志归其所有者所有；本分支不代表上述服务商或上游项目。
 
-`CHANGELOG.md` 为上游历史记录，不是 Pane Private 的发布或安全验证记录。
+`RICE_CHANGELOG.md` 记录 rice monitor 的变化；`CHANGELOG.md` 为上游历史记录，不是 rice monitor 的发布或安全验证记录。

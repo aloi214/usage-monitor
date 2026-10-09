@@ -24,6 +24,13 @@ export async function boot({failModes=false,failCatalogInitially=false,initialSo
  // No canvas draw/image decode is used by these settings flows. Timers and
  // animation frames do not run autonomously; tests trigger captured timers explicitly.
  w.HTMLCanvasElement.prototype.getContext=()=>null; // visual effects are explicitly outside this DOM contract test
+ // JSDOM cannot decode SVG/blob images. Model a failed decode deterministically,
+ // so real raw/default imports exercise the production tray-logo fallback.
+ w.URL.createObjectURL=()=> 'blob:synthetic-logo';w.URL.revokeObjectURL=()=>{};
+ w.Image=function(){const img=w.document.createElement('img');Object.defineProperty(img,'src',{
+  get(){return img.getAttribute('src')??'';},
+  set(value){img.setAttribute('src',value);if(value==='blob:synthetic-logo')queueMicrotask(()=>img.dispatchEvent(new w.Event('error')));},
+ });return img;};
  w.__BUILD_STAMP__='synthetic';
  const main=readFileSync(path.join(repo,'src/main.ts'),'utf8');const ast=ts.createSourceFile('main.ts',main,ts.ScriptTarget.Latest,true);
  const decl=ast.statements.find(n=>ts.isVariableStatement(n)&&n.declarationList.declarations.some(d=>d.name.getText(ast)==='config'));
@@ -32,7 +39,7 @@ export async function boot({failModes=false,failCatalogInitially=false,initialSo
  const providerDecl=ast.statements.find(n=>ts.isVariableStatement(n)&&n.declarationList.declarations.some(d=>d.name.getText(ast)==='ALL_PROVIDERS'));
  const providerIds=new Function(ts.transpileModule(providerDecl.getText(ast),{compilerOptions:{target:ts.ScriptTarget.ES2020}}).outputText+';return ALL_PROVIDERS.map(([id])=>id)')().filter(id=>id!=='hermes');
  backend.providerAutoRefresh=Object.fromEntries(providerIds.map(id=>[id,!['claude','commandcode'].includes(id)]));
- Object.assign(backend,{locale:'en',glassEffects:false,reduceAnimations:true,welcomeDismissed:true,lastSeenVersion:'0.4.57',firstSeenMs:1},clone(initialConfig));
+ Object.assign(backend,{locale:'en',glassEffects:false,reduceAnimations:true,welcomeDismissed:true,lastSeenVersion:'0.0.1',firstSeenMs:1},clone(initialConfig));
  backend.accessPolicy.scanSources=clone(initialSources);
  for(const [source,intent] of Object.entries(initialSources))if(intent.enabled)backend.accessPolicy.scanRoots[source]=intent.mode==='custom'?intent.customDirectories:intent.defaultDirectories;
  const configWrites=[];let failConfigRead=false;
@@ -48,7 +55,6 @@ export async function boot({failModes=false,failCatalogInitially=false,initialSo
   if(command==='get_scan_sources'){const snapshot=status();const delay=nextCatalogDelay;nextCatalogDelay=null;if(delay)await delay;if(failCatalog)throw new Error('Synthetic metadata IPC unavailable');return snapshot;}
   if(command==='get_provider_modes'){if(initialModeDelay)await initialModeDelay;if(failModes){failModes=false;throw new Error('synthetic mode failure');}return [{id:'qwen',family:'qwen',choices:[{value:'china:bearer',label:'China'}],defaultSelection:null,allowLocalOrigin:false},{id:'ollama',family:'ollama',choices:[{value:'local:http://127.0.0.1:11434',label:'Local IPv4'}],defaultSelection:null,allowLocalOrigin:true}];}
   if(command==='system_ui_locale')return 'en';
-  if(command==='get_autostart')return false;
   if(command==='pricing_status')return {last_success_ms:0,catalog_stamp:'builtin'};
   if(command==='fetch_usage'||command==='cached_usage'){const result={revision,snapshots:clone(usageSnapshots)};if(command==='fetch_usage'){const delay=nextUsageDelay;nextUsageDelay=null;if(delay)await delay;}else if(initialCachedDelay)await initialCachedDelay;return result;}
   if(command==='claude_redeem_credit'||command==='codex_redeem_credit')return {outcome:'success',message:'Synthetic credit redeemed'};
@@ -76,7 +82,7 @@ export async function boot({failModes=false,failCatalogInitially=false,initialSo
   if(command==='discover_provider_account'){backend.accessPolicy.accountBindings[`${args.family}@identified`]={family:args.family,directory:args.directory,name:'Synthetic account'};revision++;return replyAccess(command);}
   if(command==='set_api_key'){if(delayKey)await delayKey;return null;}
   if(command==='reset_provider_access'){backend.accessPolicy={version:1,enabledAccounts:[],enabledFamilies:[],regions:{},accountBindings:{},scanRoots:{},scanSources:{}};revision++;return replyAccess(command);}
-  if(['sync_tray_surfaces','widget_apply','set_api_key','set_autostart','set_shortcut','hide_popover'].includes(command))return null;
+  if(['sync_tray_surfaces','widget_apply','set_api_key','set_shortcut','hide_popover'].includes(command))return null;
   throw new Error(`Unexpected IPC ${command}`);
  };
  const cache=new Map();
@@ -86,10 +92,10 @@ export async function boot({failModes=false,failCatalogInitially=false,initialSo
   const require=specifier=>{
    if(specifier==='@tauri-apps/api/core')return {invoke};
    if(specifier==='@tauri-apps/api/event')return {listen:async(name,callback)=>{events.set(name,callback);return ()=>events.delete(name);}};
-   if(specifier==='@tauri-apps/api/app')return {getVersion:async()=>'0.4.57'};
+   if(specifier==='@tauri-apps/api/app')return {getVersion:async()=>'0.0.1'};
    if(specifier==='@tauri-apps/plugin-opener')return {openUrl:async()=>{throw new Error('External URL access forbidden');}};
-   if(specifier.endsWith('?raw'))return readFileSync(path.resolve(path.dirname(file),specifier.slice(0,-4)),'utf8');
-   if(specifier.endsWith('?inline'))return 'data:image/png;base64,AA==';
+   if(specifier.endsWith('?raw'))return {default:readFileSync(path.resolve(path.dirname(file),specifier.slice(0,-4)),'utf8')};
+   if(specifier.endsWith('?inline'))return {default:'data:image/png;base64,AA=='};
    if(specifier.startsWith('.'))return load(path.resolve(path.dirname(file),specifier+'.ts'));
    throw new Error(`Unexpected import ${specifier}`);
   };

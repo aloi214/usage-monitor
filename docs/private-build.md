@@ -1,19 +1,19 @@
-# Pane Private：构建与使用
+# rice monitor：构建与使用
 
-本指南面向源码分支，优先使用中文，界面英文标签写在括号中。上游基线为 `a55578c`，应用名称为 **Pane Private**，Tauri 标识为 `local.pane.private`。请使用此私有分支的完整源码；克隆上游或安装上游发布包不能获得这些修改。
+本指南面向源码分支，优先使用中文，界面英文标签写在括号中。上游基线为 `a55578c`，应用名称为 **rice monitor 0.0.1**，Tauri 标识为 `local.pane.private`。请使用此私有分支的完整源码；克隆上游或安装上游发布包不能获得这些修改。
 
 <a id="integration-status"></a>
 ## 实现与验证边界
 
-最新变化是[按平台控制自动刷新配额](provider-auto-refresh.md)。[CommandCode GOAT 实验性接入](commandcode-provider.md)、[单账号额度刷新](scoped-quota-refresh.md)与[Windows 发布包体积配置](release-package.md)继续适用；[CommandCode 验证](commandcode-validation.md)、[单账号刷新验证](scoped-refresh-validation.md)和[Claude 默认手动查询说明](manual-claude-query.md)中的数字只属于各自旧版本，不覆盖按平台自动刷新。
+最新变化是[改名为 rice monitor、版本从 0.0.1 开始与移除开机启动](rice-monitor-0.0.1.md)。[按平台控制自动刷新配额](provider-auto-refresh.md)继续适用。[CommandCode GOAT 实验性接入](commandcode-provider.md)、[单账号额度刷新](scoped-quota-refresh.md)与[Windows 发布包体积配置](release-package.md)继续适用；[CommandCode 验证](commandcode-validation.md)、[单账号刷新验证](scoped-refresh-validation.md)和[Claude 默认手动查询说明](manual-claude-query.md)中的数字只属于各自旧版本，不覆盖按平台自动刷新。
 
 设置功能与通用更新步骤见[设置更新](settings-update.md)。[设置版验证](settings-validation.md)和[更早交付验证](validation.md)仅对应各自标明的旧代码提交。
 
 - 源码已实现独立配置、移除遥测与自动更新、移除 One/New API/Sub2API、默认关闭账户访问，以及独立本地日志目录授权。
 - 同时已实现精确区域/连接模式及受限请求通道、手动公开价格同步、日志片段哈希缓存和 OAuth 刷新协调。下文描述此分支的使用方式，不代表每个原生环境或服务商账户均已实测。
-- 使用者已反馈上一版在 Windows 11 完成开发版构建并显示界面。此反馈不覆盖后续统一设置、单账号刷新、打包配置、CommandCode 及按平台自动刷新；这些变化的浏览器渲染/原生交互仍待验证，安装包、托盘交互、真实账户联网、CLI 同时运行及完整网络流量审计也未完成。
+- 使用者已反馈上一版在 Windows 11 完成开发版构建并显示界面。此反馈不覆盖后续统一设置、单账号刷新、打包配置、CommandCode 及按平台自动刷新；这些变化的浏览器渲染/原生交互仍待验证，原生安装、托盘交互、真实账户联网、CLI 同时运行及完整网络流量审计也未完成。前身源码已通过 Windows CI 的 Node/Rust 测试与 NSIS 构建；这不代表当前改名版本已通过同样检查，请查看当前 PR。
 - 前端构建、合成界面测试和 Windows 交叉目标类型检查各自只能验证一部分，不能替代本次版本的真实渲染、原生运行与安装验收。
-- 不应从上游版本号推断本分支已发布、已签名或已验证。`CHANGELOG.md` 是上游历史。
+- 不应从上游版本号推断本分支已发布、已签名或已验证。`RICE_CHANGELOG.md` 是本产品变化记录，`CHANGELOG.md` 是上游历史。
 
 ## 1. 构建条件
 
@@ -148,4 +148,4 @@ StepFun 的 **Plan Credits** 仅是获准日志的本地估算；设置的套餐
 
 Use this private source tree, install dependencies with `npm ci`, then run `npm run build` and, on a suitably configured Windows machine, `npm run tauri dev`. `npm run tauri build` defaults to NSIS-only packaging under `src-tauri/target/release/bundle/nsis/` unless the target directory/target triple changes. The size-focused release profile has no measured size promise and does not shrink development caches. Missing WebView2 is downloaded during installation; see [packaging details](release-package.md). No installer or native acceptance is implied. An account card’s refresh queries only its exact bound account; global Refresh / Ctrl+R retains its all-authorized-accounts behavior. A Kimi card refresh keeps any authorized Moonshot wallet rows as saved data; use global Refresh to update that folded wallet. See [scoped refresh](scoped-quota-refresh.md).
 
-Open **Platform management** for provider/account permissions, exact region/connection modes, keys, and metrics/layout. A platform switch does not authorize any account; choose accounts individually. Turning it off revokes their queries and refreshes, while hiding a metric only changes the display. In **Settings → Local log sources**, independently enable each tool’s known **Default location** or save **Custom locations**. A custom save replaces the selected locations and keeps the current On/Off state. Invalid saves retain the old grant without fallback. Off revokes reads but remembers locations; a missing directory is a separate status. Existing multiple grants stay enabled Custom without added defaults. See [update steps](settings-update.md#english-update-steps). **Auto-refresh quotas** controls each account-query family separately; extra accounts inherit the family choice and the interval stays global. Claude and CommandCode default off, others default on, with all account grants still default off. Hermes has no quota-auto switch. Off preserves historical data and authorized manual refresh, without cancelling already-sent requests or disabling separately granted local logs. See [auto-refresh](provider-auto-refresh.md). The earlier Windows 11 development build/render was user-reported; the later settings, scoped-refresh, CommandCode, and auto-refresh changes still need rendered/native acceptance, and the installer remains unverified.
+Open **Platform management** for provider/account permissions, exact region/connection modes, keys, and metrics/layout. A platform switch does not authorize any account; choose accounts individually. Turning it off revokes their queries and refreshes, while hiding a metric only changes the display. In **Settings → Local log sources**, independently enable each tool’s known **Default location** or save **Custom locations**. A custom save replaces the selected locations and keeps the current On/Off state. Invalid saves retain the old grant without fallback. Off revokes reads but remembers locations; a missing directory is a separate status. Existing multiple grants stay enabled Custom without added defaults. See [update steps](settings-update.md#english-update-steps). **Auto-refresh quotas** controls each account-query family separately; extra accounts inherit the family choice and the interval stays global. Claude and CommandCode default off, others default on, with all account grants still default off. Hermes has no quota-auto switch. Off preserves historical data and authorized manual refresh, without cancelling already-sent requests or disabling separately granted local logs. See [auto-refresh](provider-auto-refresh.md). The earlier Windows 11 development build/render was user-reported; the later settings, scoped-refresh, CommandCode, and auto-refresh changes still need rendered/native acceptance, and native installation remains unverified. The predecessor passed Windows CI tests and NSIS packaging; check the current PR for this renamed build.

@@ -1,6 +1,6 @@
 # CommandCode GOAT：实验性额度查询
 
-Pane Private 新增 CommandCode，原有 22 个服务商全部保留，合计 23 个。此接入只存在于本私有源码分支，账户权限和自动刷新均默认关闭；**尚未用真实用户密钥验证登录、套餐或额度返回，不能据此认定你的账户已接通**。最初接入的自动化结果见[历史验证记录](commandcode-validation.md)；当前自动刷新设置见[按平台自动刷新](provider-auto-refresh.md)。
+rice monitor 新增 CommandCode，原有 22 个服务商全部保留，合计 23 个。此接入只存在于本私有源码分支，账户权限和自动刷新均默认关闭；**尚未用真实用户密钥验证登录、套餐或额度返回，不能据此认定你的账户已接通**。最初接入的自动化结果见[历史验证记录](commandcode-validation.md)；当前自动刷新设置见[按平台自动刷新](provider-auto-refresh.md)。
 
 ## 怎样配置
 

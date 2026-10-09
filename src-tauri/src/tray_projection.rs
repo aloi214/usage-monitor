@@ -2,6 +2,8 @@ use crate::providers;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+const APP_NAME: &str = "rice monitor";
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TrayProjectionConfig {
@@ -97,7 +99,7 @@ pub(crate) fn project_main_tray(
         return MainTrayProjection {
             icon_mode: MainTrayIconMode::Logo,
             remaining_percentages: Vec::new(),
-            tooltip: "Pane".into(),
+            tooltip: APP_NAME.into(),
         };
     };
     let mut icon_metrics = ordinary_metrics(icon_provider, config.providers.get(&icon_provider.id));
@@ -185,7 +187,7 @@ pub(crate) fn project_main_tray(
 }
 
 fn tooltip_from_lines(lines: &[(&str, String)]) -> String {
-    let mut tooltip = String::from("Pane");
+    let mut tooltip = String::from(APP_NAME);
     for (_, line) in lines {
         tooltip.push('\n');
         tooltip.push_str(line);
@@ -194,7 +196,7 @@ fn tooltip_from_lines(lines: &[(&str, String)]) -> String {
 }
 
 fn tooltip_utf16_len(lines: &[(&str, String)]) -> usize {
-    4 + lines
+    APP_NAME.encode_utf16().count() + lines
         .iter()
         .map(|(_, line)| 1 + line.encode_utf16().count())
         .sum::<usize>()
@@ -392,11 +394,11 @@ mod tests {
         let result = project_main_tray(&snapshots, &cfg, false);
         assert_eq!(result.icon_mode, MainTrayIconMode::Logo);
         assert!(result.remaining_percentages.is_empty());
-        assert_eq!(result.tooltip, "Pane\nFirst: HTTP 401\nSecond: HTTP 403");
+        assert_eq!(result.tooltip, "rice monitor\nFirst: HTTP 401\nSecond: HTTP 403");
         cfg.disabled.push("sub2api@first".into());
-        assert_eq!(project_main_tray(&snapshots, &cfg, false).tooltip, "Pane\nSecond: HTTP 403");
+        assert_eq!(project_main_tray(&snapshots, &cfg, false).tooltip, "rice monitor\nSecond: HTTP 403");
         cfg.disabled.push("sub2api".into());
-        assert_eq!(project_main_tray(&snapshots, &cfg, false).tooltip, "Pane");
+        assert_eq!(project_main_tray(&snapshots, &cfg, false).tooltip, "rice monitor");
     }
 
     #[test]
@@ -428,9 +430,9 @@ mod tests {
         cfg.providers.insert(snap.id.clone(), layout);
         let projected = project_main_tray(std::slice::from_ref(&snap), &cfg, false);
         assert_eq!(projected.remaining_percentages, vec![5]);
-        assert_eq!(projected.tooltip, "Pane\nSite · Key 5h: 5% left");
+        assert_eq!(projected.tooltip, "rice monitor\nSite · Key 5h: 5% left");
         cfg.disabled.push("sub2api".into());
-        assert_eq!(project_main_tray(&[snap], &cfg, false).tooltip, "Pane");
+        assert_eq!(project_main_tray(&[snap], &cfg, false).tooltip, "rice monitor");
     }
 
     #[test]
@@ -445,7 +447,7 @@ mod tests {
         let result = project_main_tray(&[wallet], &cfg, false);
         assert_eq!(result.icon_mode, MainTrayIconMode::Logo);
         assert!(result.remaining_percentages.is_empty());
-        assert_eq!(result.tooltip, "Pane\n⚠ Wallet Balance: $-2.50 · Overdue");
+        assert_eq!(result.tooltip, "rice monitor\n⚠ Wallet Balance: $-2.50 · Overdue");
         let unknown = snapshot("sub2api@tray-wallet", "Wallet", vec![
             Metric::text("Type", "Unknown type".into()),
             Metric::text("Remaining amount", "15.00".into()),
@@ -489,7 +491,7 @@ mod tests {
         assert_eq!(result.remaining_percentages, vec![82, 37]);
         assert_eq!(
             result.tooltip,
-            "Pane\nCodex Session: 82% left, Weekly: 37% left"
+            "rice monitor\nCodex Session: 82% left, Weekly: 37% left"
         );
     }
 
@@ -509,7 +511,7 @@ mod tests {
         assert_eq!(result.remaining_percentages, vec![85]);
         assert_eq!(
             result.tooltip,
-            "Pane\nCodex Weekly: 85% left\nClaude Session: 30% left"
+            "rice monitor\nCodex Weekly: 85% left\nClaude Session: 30% left"
         );
     }
 
@@ -533,7 +535,7 @@ mod tests {
         let result = project_main_tray(&snapshots, &cfg, false);
 
         assert_eq!(result.remaining_percentages, vec![40]);
-        assert_eq!(result.tooltip, "Pane\nClaude Work Session: 40% left");
+        assert_eq!(result.tooltip, "rice monitor\nClaude Work Session: 40% left");
         assert_eq!(cfg.provider_order, vec!["claude@home", "claude@work"]);
     }
 
@@ -560,7 +562,7 @@ mod tests {
         assert_eq!(result.remaining_percentages, vec![40, 80]);
         assert_eq!(
             result.tooltip,
-            "Pane\nCodex Monthly: 40% left, Session: 80% left"
+            "rice monitor\nCodex Monthly: 40% left, Session: 80% left"
         );
     }
 
@@ -589,7 +591,7 @@ mod tests {
         assert_eq!(result.remaining_percentages, vec![45, 75]);
         assert_eq!(
             result.tooltip,
-            "Pane\nCodex Session: 90% left\nClaude Weekly: 45% left, Session: 75% left"
+            "rice monitor\nCodex Session: 90% left\nClaude Weekly: 45% left, Session: 75% left"
         );
     }
 
@@ -631,7 +633,7 @@ mod tests {
         let result = project_main_tray(&[stale], &cfg, false);
 
         assert_eq!(result.remaining_percentages, vec![66]);
-        assert_eq!(result.tooltip, "Pane\n⚠ Codex Weekly: 66% left");
+        assert_eq!(result.tooltip, "rice monitor\n⚠ Codex Weekly: 66% left");
     }
 
     #[test]
@@ -659,7 +661,7 @@ mod tests {
 
     #[test]
     fn tooltip_keeps_a_complete_line_at_the_exact_utf16_limit() {
-        let provider_name = "a".repeat(106);
+        let provider_name = "a".repeat(98);
         let snapshots = vec![snapshot(
             "p1",
             &provider_name,
@@ -674,12 +676,12 @@ mod tests {
 
     #[test]
     fn tooltip_drops_a_whole_line_when_stale_marker_pushes_it_over_capacity() {
-        let mut stale = snapshot("p1", &"a".repeat(106), vec![progress("Usage", 50.0)]);
+        let mut stale = snapshot("p1", &"a".repeat(98), vec![progress("Usage", 50.0)]);
         stale.stale = true;
 
         let result = project_main_tray(&[stale], &config(&["p1"]), false);
 
-        assert_eq!(result.tooltip, "Pane");
+        assert_eq!(result.tooltip, "rice monitor");
         assert_eq!(result.icon_mode, MainTrayIconMode::Logo);
         assert!(result.remaining_percentages.is_empty());
     }
@@ -688,7 +690,7 @@ mod tests {
     fn tooltip_capacity_keeps_a_complete_two_metric_line_at_the_utf16_limit() {
         let snapshots = vec![snapshot(
             "p1",
-            &"a".repeat(86),
+            &"a".repeat(78),
             vec![progress("Session", 50.0), progress("Weekly", 50.0)],
         )];
 
@@ -698,8 +700,8 @@ mod tests {
         assert_eq!(
             result.tooltip,
             format!(
-                "Pane\n{} Session: 50% left, Weekly: 50% left",
-                "a".repeat(86)
+                "rice monitor\n{} Session: 50% left, Weekly: 50% left",
+                "a".repeat(78)
             )
         );
         assert_eq!(result.icon_mode, MainTrayIconMode::Numbers);
@@ -710,13 +712,13 @@ mod tests {
     fn tooltip_capacity_drops_an_overlong_two_metric_line_and_hides_numbers() {
         let snapshots = vec![snapshot(
             "p1",
-            &"a".repeat(87),
+            &"a".repeat(79),
             vec![progress("Session", 50.0), progress("Weekly", 50.0)],
         )];
 
         let result = project_main_tray(&snapshots, &config(&["p1"]), false);
 
-        assert_eq!(result.tooltip, "Pane");
+        assert_eq!(result.tooltip, "rice monitor");
         assert_eq!(result.icon_mode, MainTrayIconMode::Logo);
         assert!(result.remaining_percentages.is_empty());
     }
@@ -766,10 +768,10 @@ mod tests {
 
         assert_eq!(en.remaining_percentages, zh.remaining_percentages);
         assert_eq!(en.remaining_percentages, ru.remaining_percentages);
-        assert_eq!(zh.tooltip, "Pane\nCodex 每周: 剩余 77%，会话: 剩余 90%");
+        assert_eq!(zh.tooltip, "rice monitor\nCodex 每周: 剩余 77%，会话: 剩余 90%");
         assert_eq!(
             ru.tooltip,
-            "Pane\nCodex За неделю: осталось 77%, Сессия: осталось 90%"
+            "rice monitor\nCodex За неделю: осталось 77%, Сессия: осталось 90%"
         );
     }
 
@@ -781,7 +783,7 @@ mod tests {
 
         assert_eq!(result.icon_mode, MainTrayIconMode::Logo);
         assert!(result.remaining_percentages.is_empty());
-        assert_eq!(result.tooltip, "Pane\nCodex Weekly: 77% left");
+        assert_eq!(result.tooltip, "rice monitor\nCodex Weekly: 77% left");
     }
 
     #[test]
@@ -796,7 +798,7 @@ mod tests {
 
         assert_eq!(result.icon_mode, MainTrayIconMode::Logo);
         assert!(result.remaining_percentages.is_empty());
-        assert_eq!(result.tooltip, "Pane");
+        assert_eq!(result.tooltip, "rice monitor");
     }
 
     #[test]
@@ -835,7 +837,7 @@ mod tests {
         let result = project_main_tray(&snapshots, &cfg, false);
 
         assert_eq!(result.remaining_percentages, vec![30]);
-        assert_eq!(result.tooltip, "Pane\nClaude Weekly: 30% left");
+        assert_eq!(result.tooltip, "rice monitor\nClaude Weekly: 30% left");
     }
 
     #[test]
@@ -853,7 +855,7 @@ mod tests {
         let result = project_main_tray(&snapshots, &cfg, false);
 
         assert_eq!(result.remaining_percentages, vec![65]);
-        assert_eq!(result.tooltip, "Pane\nCodex New: 65% left");
+        assert_eq!(result.tooltip, "rice monitor\nCodex New: 65% left");
     }
 
     #[test]
@@ -889,8 +891,8 @@ mod tests {
         cfg.disabled.clear();
         let reenabled = project_main_tray(&snapshots, &cfg, false);
 
-        assert!(disabled.tooltip.starts_with("Pane\nClaude"));
-        assert!(reenabled.tooltip.starts_with("Pane\nCodex"));
+        assert!(disabled.tooltip.starts_with("rice monitor\nClaude"));
+        assert!(reenabled.tooltip.starts_with("rice monitor\nCodex"));
         assert_eq!(cfg.provider_order, vec!["codex", "claude"]);
     }
 
@@ -930,7 +932,7 @@ mod tests {
 
         assert_eq!(result.icon_mode, MainTrayIconMode::Logo);
         assert!(result.remaining_percentages.is_empty());
-        assert_eq!(result.tooltip, "Pane");
+        assert_eq!(result.tooltip, "rice monitor");
         assert_eq!(cfg.provider_order, vec!["onenewapi@k1", "onenewapi@k2"]);
     }
 
@@ -957,7 +959,7 @@ mod tests {
         assert_eq!(result.remaining_percentages, vec![60]);
         assert_eq!(
             result.tooltip,
-            "Pane\nSite · Key 2 Usage: 60% left\nCodex Session: 90% left"
+            "rice monitor\nSite · Key 2 Usage: 60% left\nCodex Session: 90% left"
         );
         assert_eq!(
             cfg.provider_order,
@@ -991,7 +993,7 @@ mod tests {
 
     #[test]
     fn tooltip_keeps_a_complete_line_just_below_the_utf16_limit() {
-        let provider_name = "a".repeat(105);
+        let provider_name = "a".repeat(97);
         let snapshots = vec![snapshot(
             "p1",
             &provider_name,

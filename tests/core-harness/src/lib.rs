@@ -34,3 +34,6 @@ fn card_is_disabled(id: &str, disabled: &[String]) -> bool {
 }
 #[path = "../../../src-tauri/src/httpapi.rs"]
 mod httpapi;
+
+#[path = "../../../src-tauri/src/startup_cleanup.rs"]
+mod startup_cleanup;

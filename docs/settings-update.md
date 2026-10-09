@@ -1,8 +1,10 @@
-# Pane Private：设置更新与升级步骤
+# rice monitor：设置更新与升级步骤
+
+当前产品已改名为 rice monitor 0.0.1。旧 Pane Private 安装版请先按[改名升级说明](rice-monitor-0.0.1.md)处理；不要直接并排安装并继续运行旧版本。
 
 本文记录此前的设置更新，并补充当前入口说明；后续新增的[按平台自动刷新](provider-auto-refresh.md)、[单账号额度刷新](scoped-quota-refresh.md)和[Windows 打包配置](release-package.md)见各自说明。下方测试数字仅属于原设置更新版本。
 
-本次更新整理平台设置，并简化本地日志来源的授权。使用这个分支的完整新源码；上游 Pane 安装包不包含这些修改。已有的 Pane Private 用户配置和缓存无需删除。
+本次更新整理平台设置，并简化本地日志来源的授权。使用这个分支的完整新源码；上游 Pane 安装包不包含这些修改。已有的 rice monitor 用户配置和缓存无需删除。
 
 ## 改了什么
 
@@ -33,7 +35,7 @@
 
 ## Windows 11 更新步骤
 
-1. **退出旧版本。** 在运行 `npm run tauri dev` 的终端按 `Ctrl+C`。如果托盘里仍有 Pane Private，再从托盘退出应用，避免新旧进程同时运行。
+1. **退出旧版本。** 在运行 `npm run tauri dev` 的终端按 `Ctrl+C`。如果托盘里仍有 rice monitor，再从托盘退出应用，避免新旧进程同时运行。
 2. **放入完整新源码。** 可以解压到一个新的源码文件夹，或更新现有源码目录。保留 `%APPDATA%\PanePrivate` 中的用户配置与缓存，不要为更新清空 AppData，也不要导入或覆盖上游 Pane/OpenUsage 的配置。无需复制旧的 `node_modules`、`dist` 或编译产物。
 3. **在新源码根目录重新安装依赖并构建前端。** 本次测试新增 `jsdom` 26.x 开发依赖，兼容 Node.js 20；使用随源码提供的锁文件，不要跳过 `npm ci`。
 
@@ -78,7 +80,7 @@ The side-bar **Platform management** panel now holds accounts, exact connection/
 
 To update on Windows:
 
-1. Stop the old `npm run tauri dev` with `Ctrl+C`, and quit any remaining Pane Private tray process.
+1. Stop the old `npm run tauri dev` with `Ctrl+C`, and quit any remaining rice monitor tray process.
 2. Extract the complete updated source into a source folder. Keep the existing `%APPDATA%\PanePrivate` configuration and caches; do not clear AppData or import upstream state.
 3. Run `npm ci` and `npm run build`. The new test dependency is Node.js-20-compatible `jsdom` 26.x.
 4. Run `npm run tauri dev` again, or build NSIS with `npm run tauri -- build --bundles nsis` using the Windows prerequisites.

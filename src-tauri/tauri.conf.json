@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Pane Private",
-  "version": "0.4.57",
+  "productName": "rice monitor",
+  "version": "0.0.1",
   "identifier": "local.pane.private",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Pane Private",
+        "title": "rice monitor",
         "dragDropEnabled": false,
         "width": 380,
         "height": 600,
@@ -36,10 +36,10 @@
     "active": true,
     "targets": ["nsis"],
     "createUpdaterArtifacts": false,
-    "publisher": "Pane",
+    "publisher": "rice monitor",
     "copyright": "\u00a9 2026 Pane contributors (MIT)",
     "shortDescription": "AI usage limits in your system tray",
-    "longDescription": "Pane shows how much of your session and weekly limits each AI tool has left, directly from the Windows system tray.",
+    "longDescription": "rice monitor shows how much of your session and weekly limits each AI tool has left, directly from the Windows system tray.",
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
@@ -47,6 +47,7 @@
       },
       "nsis": {
         "installerIcon": "icons/icon.ico",
+        "installerHooks": "windows/installer-hooks.nsh",
         "compression": "lzma"
       }
     },

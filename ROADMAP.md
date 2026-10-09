@@ -1,3 +1,5 @@
+> Historical upstream roadmap, retained for attribution and context. Current rice monitor behavior and release status are documented in [README.md](README.md) and [RICE_CHANGELOG.md](RICE_CHANGELOG.md). The claims below do not describe this fork’s current verification or update/signing behavior.
+
 # Roadmap — full Mac parity (and beyond)
 
 **Status (v0.4.56, 2026-10-01): every wave below is shipped, and the

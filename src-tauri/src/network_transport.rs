@@ -155,7 +155,7 @@ impl CheckedClient {
 fn base_client() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("Pane-Private/0.4")
+        .user_agent(concat!("rice-monitor/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(20))
         .connect_timeout(Duration::from_secs(5))
 }
