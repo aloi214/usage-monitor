@@ -4551,6 +4551,10 @@ mod tests {
     fn late_failure_after_key_rotation_cannot_bench_the_new_context() {
         let id = "kilo";
         let _guard = SnapCacheGuard::new(id);
+        let mut policy = crate::access_policy::AccessPolicy::default();
+        policy.set_family(id, true).unwrap();
+        policy.set_account(id, true).unwrap();
+        let runtime = std::sync::Arc::new(crate::access_policy::AccessRuntime::new(policy));
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let fut = async move {
@@ -4559,7 +4563,9 @@ mod tests {
             Snapshot::error(id, "Kilo", "HTTP 429 rate limited".into())
         };
         let handle = std::thread::spawn(move || {
-            tauri::async_runtime::block_on(guarded(id.to_string(), "Kilo".into(), fut))
+            tauri::async_runtime::block_on(runtime.run_account(
+                id, &[], guarded(id.to_string(), "Kilo".into(), fut),
+            )).expect("synthetic account grant")
         });
         started_rx.recv().unwrap();
         drop(KeyCardMutationGuard::begin(vec![id.to_string()]));
@@ -4574,11 +4580,17 @@ mod tests {
 
     #[test]
     fn fresh_failure_without_rotation_still_benches() {
-        let id = "kilo-control";
+        let id = "codebuff";
         let _guard = SnapCacheGuard::new(id);
-        let snap = tauri::async_runtime::block_on(guarded(id.to_string(), "Kilo".into(), async {
-            Snapshot::error(id, "Kilo", "HTTP 429 rate limited".into())
-        }));
+        let mut policy = crate::access_policy::AccessPolicy::default();
+        policy.set_family(id, true).unwrap();
+        policy.set_account(id, true).unwrap();
+        let runtime = std::sync::Arc::new(crate::access_policy::AccessRuntime::new(policy));
+        let snap = tauri::async_runtime::block_on(runtime.run_account(
+            id, &[], guarded(id.to_string(), "Codebuff".into(), async {
+                Snapshot::error(id, "Codebuff", "HTTP 429 rate limited".into())
+            }),
+        )).expect("synthetic account grant");
         assert_eq!(snap.status, "error");
         assert!(fail_state().lock().unwrap().contains_key(id));
     }

@@ -4102,6 +4102,12 @@ pub fn collect(policy: &ScanPolicy, cursor_csv: Option<String>) -> Vec<ProviderS
 
 #[cfg(test)]
 mod tests {
+    // Match ScanPolicy's canonical authority spelling, including Windows
+    // verbatim prefixes and expanded short names, before creating children.
+    fn fixture_temp_dir() -> std::path::PathBuf {
+        std::env::temp_dir().canonicalize().expect("canonical fixture temp directory")
+    }
+
     use super::*;
     use serde_json::json;
     struct TestScanScope {
@@ -4182,7 +4188,7 @@ mod tests {
     #[test]
     fn scan_stops_at_the_depth_cap() {
         let _scan_scope = test_scan_scope();
-        let base = std::env::temp_dir().join(format!("pane-scan-depth-{}", std::process::id()));
+        let base = fixture_temp_dir().join(format!("pane-scan-depth-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let mut deep = base.clone();
         for i in 0..MAX_SCAN_DEPTH + 4 {
@@ -4207,17 +4213,19 @@ mod tests {
     #[cfg(windows)]
     fn junction_alias_counts_each_log_once() {
         let _scan_scope = test_scan_scope();
-        let base = std::env::temp_dir().join(format!("pane-scan-junction-{}", std::process::id()));
+        // cmd's mklink consumes ordinary paths; scanning uses canonical paths.
+        let raw_base = std::env::temp_dir().join(format!("pane-scan-junction-{}", std::process::id()));
+        let base = fixture_temp_dir().join(raw_base.file_name().unwrap());
         let _ = fs::remove_dir_all(&base);
         let real = base.join("real");
         fs::create_dir_all(&real).unwrap();
         fs::create_dir_all(base.join("other")).unwrap();
         fs::write(real.join("session.jsonl"), "{}").unwrap();
-        let link = base.join("alias");
+        let link = raw_base.join("alias");
         let status = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(&link)
-            .arg(&real)
+            .arg(raw_base.join("real"))
             .status();
         if !status.map(|s| s.success()).unwrap_or(false) {
             let _ = fs::remove_dir_all(&base);
@@ -4237,7 +4245,7 @@ mod tests {
     #[test]
     fn serialized_cache_has_no_fixture_text() {
         let _scan_scope = test_scan_scope();
-        let path = std::env::temp_dir().join(format!(
+        let path = fixture_temp_dir().join(format!(
             "pane-fingerprint-secret-{}.jsonl",
             std::process::id()
         ));
@@ -4388,7 +4396,7 @@ mod tests {
     #[test]
     fn file_days_records_price_probes() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-probe-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-probe-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("probe-test.jsonl");
         let line = json!({"type": "usage.record", "model": "kimi-code/k3",
@@ -4445,7 +4453,7 @@ mod tests {
     #[test]
     fn cache_unchanged_rejects_stale_prices() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-cache-gen-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-cache-gen-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("session.jsonl");
         let line = json!({
@@ -4488,7 +4496,7 @@ mod tests {
         let _scan_scope = test_scan_scope();
         // A directory has metadata but cannot be read as a file — the
         // previous insert-on-open-failure path would cache empty spend.
-        let dir = std::env::temp_dir().join(format!("pane-unreadable-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-unreadable-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let data = file_days(&dir, &mut |_, _| {});
         assert!(data.days.is_empty());
@@ -4500,7 +4508,7 @@ mod tests {
     #[test]
     fn file_days_reads_only_the_appended_tail() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-jsonl-tail-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-jsonl-tail-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("grow.jsonl");
         let line = |tokens: f64| {
@@ -4535,7 +4543,7 @@ mod tests {
     fn append_truncate_and_rewrite_detection_preserved() {
         let _scope = test_scan_scope();
         let path =
-            std::env::temp_dir().join(format!("pane-truncate-hash-{}.jsonl", std::process::id()));
+            fixture_temp_dir().join(format!("pane-truncate-hash-{}.jsonl", std::process::id()));
         let line = |tokens: f64| {
             json!({"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":tokens,"output":0.},"usageScope":"turn","time":1784208630652i64}).to_string()+"\n"
         };
@@ -4552,7 +4560,7 @@ mod tests {
     #[test]
     fn file_days_warms_codex_state_on_the_tail() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-codex-warm-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-codex-warm-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("rollout.jsonl");
         let head = vec![
@@ -4595,7 +4603,7 @@ mod tests {
     #[test]
     fn file_days_does_not_skip_a_completed_partial_line() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-jsonl-partial-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-jsonl-partial-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("partial.jsonl");
         let line = |tokens: f64| {
@@ -4638,7 +4646,7 @@ mod tests {
     #[test]
     fn file_days_counts_a_final_record_without_newline() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-jsonl-final-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-jsonl-final-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("final.jsonl");
         let line = |tokens: f64| {
@@ -4697,7 +4705,7 @@ mod tests {
     #[test]
     fn claude_checkpoint_drops_a_replay_older_than_warmup() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-claude-ckpt-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-claude-ckpt-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("session.jsonl");
         let line = |mid: &str, rid: &str, tokens: f64| {
@@ -4742,7 +4750,7 @@ mod tests {
     #[test]
     fn file_days_aligns_a_legacy_midline_offset() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-jsonl-legacy-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-jsonl-legacy-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("legacy.jsonl");
         let line = |tokens: f64| {
@@ -4788,7 +4796,7 @@ mod tests {
     #[test]
     fn file_days_full_parses_a_larger_rewrite() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-jsonl-rewrite-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-jsonl-rewrite-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("rewrite.jsonl");
         let line = |tokens: f64, time: i64| {
@@ -4836,7 +4844,7 @@ mod tests {
     #[test]
     fn empty_prefix_fingerprint_rebuilds_without_double_counting() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-jsonl-oldfp-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-jsonl-oldfp-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("grow.jsonl");
         let line = |tokens: f64| {
@@ -4881,7 +4889,7 @@ mod tests {
     #[test]
     fn oversize_lines_are_skipped_without_storing() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-bigline-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-bigline-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("big-line.jsonl");
         let ok = json!({"type": "usage.record", "model": "kimi-code/k3",
@@ -4913,7 +4921,7 @@ mod tests {
     #[test]
     fn huge_log_files_are_skipped() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-hugefile-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-hugefile-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("small.jsonl"), "{}\n").unwrap();
@@ -5196,7 +5204,7 @@ mod tests {
     // ---- Codex: Orca-managed homes ---------------------------------------
 
     fn orca_test_root(tag: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!("pane-orca-{tag}-{}", std::process::id()));
+        let base = fixture_temp_dir().join(format!("pane-orca-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         base
     }
@@ -6010,7 +6018,7 @@ mod tests {
         let _scan_scope = test_scan_scope();
         // Two spellings of one existing dir must not become two roots —
         // the scan would count every file twice.
-        let base = std::env::temp_dir().join(format!("pane-pi-dedupe-{}", std::process::id()));
+        let base = fixture_temp_dir().join(format!("pane-pi-dedupe-{}", std::process::id()));
         let dir = base.join("real");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(base.join("other")).unwrap();
@@ -6420,7 +6428,7 @@ mod tests {
     #[test]
     fn replaced_file_during_parse_is_skipped_not_cached() {
         let _scan_scope = test_scan_scope();
-        let dir = std::env::temp_dir().join(format!("pane-scan-replace-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-scan-replace-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.jsonl");
         fs::write(&path, "{}\n").unwrap();

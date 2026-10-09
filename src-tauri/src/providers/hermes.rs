@@ -335,6 +335,12 @@ fn table_columns(conn: &rusqlite::Connection) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    // Match ScanPolicy's canonical authority spelling, including Windows
+    // verbatim prefixes and expanded short names, before creating children.
+    fn fixture_temp_dir() -> std::path::PathBuf {
+        std::env::temp_dir().canonicalize().expect("canonical fixture temp directory")
+    }
+
     use super::*;
 
     fn ev(ts: i64, model: &str, provider: &str, url: &str, session: &str) -> HermesUsage {
@@ -564,7 +570,7 @@ mod tests {
             .unwrap()
             .enter("hermes");
         let path =
-            std::env::temp_dir().join(format!("pane-hermes-narrow-test-{}.db", std::process::id()));
+            fixture_temp_dir().join(format!("pane-hermes-narrow-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
