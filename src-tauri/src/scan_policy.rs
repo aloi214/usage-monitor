@@ -326,12 +326,12 @@ pub fn open_log(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 /// Recheck that the open handle still names the authorized file before
-/// publishing/cache insertion. Unix identity checks survive equal-size swaps;
-/// other targets use available creation metadata as a conservative check.
+/// publishing/cache insertion. Unix and Windows compare file identity rather
+/// than timestamps, which can be preserved across equal-size replacements.
 pub fn revalidate_log(path: &Path, file: &File) -> io::Result<()> {
     let resolved = checked_path(path)?;
     let opened = file.metadata()?;
-    let current = fs::metadata(resolved)?;
+    let current = fs::metadata(&resolved)?;
     if !opened.is_file() || !current.is_file() {
         return Err(denied());
     }
@@ -342,7 +342,19 @@ pub fn revalidate_log(path: &Path, file: &File) -> io::Result<()> {
             return Err(denied());
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Keep both handles alive while comparing IDs, so a removed original
+        // cannot have its identity recycled before the comparison finishes.
+        let current_file = File::open(&resolved)?;
+        if !current_file.metadata()?.is_file()
+            || windows_file_identity(file)? != windows_file_identity(&current_file)?
+            || checked_path(path)? != resolved
+        {
+            return Err(denied());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         if opened.created().ok() != current.created().ok() {
             return Err(denied());
@@ -350,6 +362,31 @@ pub fn revalidate_log(path: &Path, file: &File) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> io::Result<(u64, [u8; 16])> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandleEx, FileIdInfo, FILE_ID_INFO,
+    };
+
+    let mut identity = FILE_ID_INFO::default();
+    // SAFETY: file owns a live handle for this synchronous call. The writable
+    // buffer is correctly aligned and sized for FileIdInfo and outlives it.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileIdInfo,
+            std::ptr::from_mut(&mut identity).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .map_err(|error| io::Error::other(format!("Cannot verify log file identity: {error}")))?;
+    // Failure to obtain identity propagates; never fall back to timestamps.
+    Ok((identity.VolumeSerialNumber, identity.FileId.Identifier))
+}
+
 /// SQLite may open its WAL, SHM, or rollback journal implicitly. Verify those
 /// names too; checking the main database alone would permit sidecar escapes.
 pub fn checked_sqlite(path: &Path) -> io::Result<PathBuf> {
@@ -388,4 +425,85 @@ pub fn checked_sqlite(path: &Path) -> io::Result<PathBuf> {
         return Err(denied());
     }
     Ok(resolved)
+}
+
+#[cfg(all(test, windows))]
+mod windows_identity_tests {
+    use super::*;
+    use std::os::windows::fs::FileTimesExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Fixture {
+        root: PathBuf,
+        _scope: ScanScope,
+    }
+
+    impl Fixture {
+        fn new(name: &str, current: Arc<AtomicBool>) -> Self {
+            let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+                "pane-file-identity-{name}-{}", std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let policy = ScanPolicy::new(BTreeMap::from([("claude".into(), vec![root.clone()])]))
+                .unwrap()
+                .with_check(move || current.load(Ordering::SeqCst));
+            Self { root, _scope: policy.enter("claude") }
+        }
+
+        fn log(&self) -> PathBuf {
+            let path = self.root.join("session.jsonl");
+            fs::write(&path, "{}\n").unwrap();
+            path
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn unchanged_file_identity_is_accepted() {
+        let fixture = Fixture::new("unchanged", Arc::new(AtomicBool::new(true)));
+        let path = fixture.log();
+        let file = open_log(&path).unwrap();
+        revalidate_log(&path, &file).expect("unchanged authorized file");
+    }
+
+    #[test]
+    fn hard_link_to_the_same_file_within_the_grant_is_accepted() {
+        let fixture = Fixture::new("hardlink", Arc::new(AtomicBool::new(true)));
+        let path = fixture.log();
+        let file = open_log(&path).unwrap();
+        let alias = fixture.root.join("alias.jsonl");
+        fs::hard_link(&path, &alias).unwrap();
+        revalidate_log(&alias, &file).expect("same identity under an authorized alias");
+    }
+
+    #[test]
+    fn equal_size_replacement_with_preserved_creation_time_is_rejected() {
+        let fixture = Fixture::new("replacement", Arc::new(AtomicBool::new(true)));
+        let path = fixture.log();
+        let file = open_log(&path).unwrap();
+        let created = file.metadata().unwrap().created().unwrap();
+        fs::rename(&path, fixture.root.join("original.jsonl")).unwrap();
+        fs::write(&path, "{}\n").unwrap();
+        let replacement = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        replacement.set_times(fs::FileTimes::new().set_created(created)).unwrap();
+        drop(replacement);
+        assert_eq!(file.metadata().unwrap().len(), fs::metadata(&path).unwrap().len());
+        assert_eq!(file.metadata().unwrap().created().unwrap(), fs::metadata(&path).unwrap().created().unwrap());
+        assert_eq!(revalidate_log(&path, &file).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn revoked_grant_still_rejects_an_unchanged_open_file() {
+        let current = Arc::new(AtomicBool::new(true));
+        let fixture = Fixture::new("revoked", current.clone());
+        let path = fixture.log();
+        let file = open_log(&path).unwrap();
+        current.store(false, Ordering::SeqCst);
+        assert_eq!(revalidate_log(&path, &file).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
 }

@@ -18,3 +18,6 @@ md-5 = "0.11.0"
 getrandom = "0.2"
 
 sha2 = "0.10" # non-persisted credential equality fingerprint for Qwen cooldown
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
