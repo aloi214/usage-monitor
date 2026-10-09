@@ -736,6 +736,44 @@ function ensureLayout(): void {
   // Configured One/New API keys keep an independent layout slot even
   // when the family is off (no snapshot). Append only — never regroup.
 
+  // Quota-window labels now identify distinct pools. Expand the old Z.ai
+  // token slot only after actual token windows arrive; a live bare label is
+  // still a real unknown window. Hidden/on-demand intent covers every new
+  // pool, while an ambiguous star/pin chooses 5 Hours, then the first pool.
+  // Existing explicit window positions and preferences always win. Kimi's
+  // legacy Weekly slot becomes Monthly only when no real Weekly pool exists.
+  for (const s of lastSnapshots) {
+    if (s.status !== "ok") continue;
+    const family = providerFamily(s.id);
+    const labels = s.metrics.filter((m) => m.kind === "progress").map((m) => m.label);
+    const replacements = family === "zai"
+      ? [...new Set(labels.filter((label) => label === "5 Hours" || label === "Weekly" || /^tokens_limit(?: \(.*\))?$/i.test(label)))]
+      : family === "kimi" && labels.includes("Monthly") && !labels.includes("Weekly") ? ["Monthly"] : [];
+    if (!replacements.length) continue;
+    const preferred = replacements.includes("5 Hours") ? "5 Hours" : replacements[0];
+    const ordered = [preferred, ...replacements.filter((label) => label !== preferred)];
+    const aliases = (family === "zai" ? ["TOKENS_LIMIT", "token_limit"] : ["Weekly"])
+      .filter((label) => !labels.includes(label));
+    const L = layout.providers[s.id];
+    if (L) {
+      const explicit = new Set(L.metricOrder.filter((label) => !aliases.includes(label)));
+      for (const field of ["metricOrder", "hidden", "onDemand", "starred"] as const) {
+        const list = L[field];
+        if (!list.some((label) => aliases.includes(label))) continue;
+        const targets = field === "starred" ? (list.includes(preferred) ? [] : [preferred])
+          : field === "metricOrder" ? ordered.filter((label) => !list.includes(label))
+          : ordered.filter((label) => !explicit.has(label));
+        const next = list.flatMap((label) => aliases.includes(label) ? targets : [label]);
+        L[field] = [...new Set(next)];
+        changed = true;
+      }
+    }
+    if (config.pinned?.provider === s.id && aliases.includes(config.pinned.label)) {
+      config.pinned = { ...config.pinned, label: preferred };
+      changed = true; // patchConfig below persists the full snapshot, including the pin.
+    }
+  }
+
   // One-time label migration (Cursor bucket-era rename, 0.4.35): "Auto
   // usage" → "Cursor Models", "API usage" → "Other Models". Stars, pins,
   // hidden/on-demand flags and row order carry over — without this, a

@@ -4200,8 +4200,17 @@ mod tests {
         assert_eq!(before.get(rotated), after.get(rotated));
     }
 
+    // These fixtures use distinct directories but share MiniMax's process-wide
+    // snapshot, failure, and generation state. Keep each fixture's cleanup
+    // inside the lock so another test cannot evict its seeded snapshot.
+    fn minimax_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap()
+    }
+
     #[test]
     fn changing_minimax_key_forgets_remembered_tier() {
+        let _minimax_lock = minimax_test_lock();
         let tmp = TempConfig::new();
         let _minimax = SnapCacheGuard::new("minimax");
         std::fs::write(
@@ -4225,6 +4234,7 @@ mod tests {
 
     #[test]
     fn resaving_same_minimax_key_keeps_remembered_tier() {
+        let _minimax_lock = minimax_test_lock();
         let tmp = TempConfig::new();
         let _minimax = SnapCacheGuard::new("minimax");
         set_api_key_in(&tmp.dir, "minimax", "sk-same-key-xxxxxxxx").unwrap();
@@ -4249,6 +4259,7 @@ mod tests {
 
     #[test]
     fn clearing_minimax_key_forgets_remembered_tier() {
+        let _minimax_lock = minimax_test_lock();
         let tmp = TempConfig::new();
         let _minimax = SnapCacheGuard::new("minimax");
         // No key file at all — the plan cache alone still triggers the
@@ -4274,6 +4285,7 @@ mod tests {
 
     #[test]
     fn minimax_key_change_is_refused_while_stale_tier_cannot_be_removed() {
+        let _minimax_lock = minimax_test_lock();
         let tmp = TempConfig::new();
         let _minimax = SnapCacheGuard::new("minimax");
         set_api_key_in(&tmp.dir, "minimax", "sk-a-xxxxxxxxxx").unwrap();
@@ -4313,6 +4325,7 @@ mod tests {
 
     #[test]
     fn failed_minimax_key_write_restores_remembered_tier() {
+        let _minimax_lock = minimax_test_lock();
         let tmp = TempConfig::new();
         let _minimax = SnapCacheGuard::new("minimax");
         set_api_key_in(&tmp.dir, "minimax", "sk-a-xxxxxxxxxx").unwrap();
@@ -4627,6 +4640,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn failed_key_save_keeps_the_old_credential_and_state() {
+        let _minimax_lock = minimax_test_lock();
         let tmp = TempConfig::new();
         let id = "minimax";
         let _guard = SnapCacheGuard::new(id);
