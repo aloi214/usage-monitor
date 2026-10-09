@@ -1,6 +1,6 @@
-# Pane Private privacy
+# rice monitor privacy
 
-This document applies to the private source fork, not upstream Pane binaries. Pane Private removes upstream telemetry and the upstream updater. It has no Pane account or analytics upload path. It still makes the provider requests you authorize, and its local HTTP API is not an authentication boundary.
+This document applies to the private source fork, not upstream Pane binaries. rice monitor removes upstream telemetry and the upstream updater. It has no Pane account or analytics upload path. It still makes the provider requests you authorize, and its local HTTP API is not an authentication boundary.
 
 **Verification scope:** the behavior below is implemented in this private source fork. See [verification limits](private-build.md#integration-status). This is a source-level description, not an exhaustive network audit or a claim of native Windows or rendered UI validation.
 

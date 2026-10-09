@@ -205,7 +205,7 @@ async fn usages_via_login(path: &Path) -> Result<(Value, Option<String>), String
             match usages {
                 Ok(doc) => Ok((doc, plan)),
                 Err(UsagesError::Unauthorized) => Err(
-                    "Kimi Code sign-in was rotated — run `kimi login` in a terminal once and Pane recovers automatically"
+                    "Kimi Code sign-in was rotated — run `kimi login` in a terminal once and rice monitor recovers automatically"
                         .into(),
                 ),
                 Err(UsagesError::Other(e)) => Err(e),

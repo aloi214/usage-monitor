@@ -1,10 +1,10 @@
-# Pane Private security
+# rice monitor security
 
 This policy is for the private source fork, not upstream Pane releases. Read the [private build guide](docs/private-build.md), [privacy contract](docs/privacy.md), and [provider access reference](docs/providers.md) before allowing account or local-log access.
 
 ## Report privately
 
-Do not publish credentials, logs, account identifiers, configuration directories, or exploitable details in a public issue. Report fork-specific problems privately to whoever supplied or maintains your copy of Pane Private, with a minimal redacted reproduction and the exact source revision.
+Do not publish credentials, logs, account identifiers, configuration directories, or exploitable details in a public issue. Report fork-specific problems privately to whoever supplied or maintains your copy of rice monitor, with a minimal redacted reproduction and the exact source revision.
 
 If a problem also affects unmodified upstream Pane, its [security reporting page](https://github.com/ItsJazii/pane/security) is the upstream channel. That link does not establish support or a response-time commitment for this fork.
 
@@ -42,4 +42,4 @@ Failed saving after a successful remote refresh is a meaningful failure: the ser
 
 ## Updates and supported revisions
 
-There is no automatic upstream update channel in Pane Private and no claim that an upstream release supports this fork. Review, rebuild, and test the exact private source revision you use. Keep the original MIT license and attribution with redistributed copies. Do not use upstream installation instructions as instructions for this build.
+There is no automatic upstream update channel in rice monitor and no claim that an upstream release supports this fork. Review, rebuild, and test the exact private source revision you use. Keep the original MIT license and attribution with redistributed copies. Do not use upstream installation instructions as instructions for this build.

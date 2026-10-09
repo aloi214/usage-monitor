@@ -12,14 +12,14 @@ try {
   const version = tag.slice(1);
   const lock = json('package-lock.json');
   const cargoPackage = read('src-tauri/Cargo.toml').split(/^\[package\][ \t]*\r?$/m)[1]?.split(/^\[/m)[0];
-  const cargoLockPackage = read('src-tauri/Cargo.lock').split(/^\[\[package\]\][ \t]*\r?$/m).find((section) => tomlValue(section, 'name') === 'pane');
+  const cargoLockPackage = read('src-tauri/Cargo.lock').split(/^\[\[package\]\][ \t]*\r?$/m).find((section) => tomlValue(section, 'name') === 'rice-monitor');
   const versions = [
     ['package.json', json('package.json').version],
     ['package-lock.json', lock.version],
     ['package-lock.json packages[""]', lock.packages?.['']?.version],
     ['src-tauri/tauri.conf.json', json('src-tauri/tauri.conf.json').version],
     ['src-tauri/Cargo.toml', tomlValue(cargoPackage, 'version')],
-    ['src-tauri/Cargo.lock (pane)', tomlValue(cargoLockPackage, 'version')],
+    ['src-tauri/Cargo.lock (rice-monitor)', tomlValue(cargoLockPackage, 'version')],
   ];
   for (const [source, actual] of versions) {
     if (actual !== version) throw new Error(`${source}: expected ${version}, found ${actual ?? 'no version'}.`);

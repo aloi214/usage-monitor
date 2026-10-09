@@ -29,7 +29,7 @@ const en: Dict = {
 
   "platform.experimental": "Experimental",
   "settings.commandcodeExperimental": "Experimental GOAT quota integration. Authentication and response compatibility have not been verified with a live account.",
-  "settings.commandcodeKeyHelp": "Enter your CommandCode API key here; Pane does not read CommandCode CLI credentials. Saving does not authorize queries. Enable the platform and account separately, then refresh manually. Leave empty and Save to remove the stored key.",
+  "settings.commandcodeKeyHelp": "Enter your CommandCode API key here; rice monitor does not read CommandCode CLI credentials. Saving does not authorize queries. Enable the platform and account separately, then refresh manually. Leave empty and Save to remove the stored key.",
   "stale.relogin.commandcode": "check the CommandCode API key in Platform management",
   "metric.monthlyCreditsRemaining": "Monthly credits remaining",
   "metric.purchasedCredits": "Purchased credits",
@@ -224,8 +224,8 @@ const en: Dict = {
   "sidebar.customize": "Platform management",
   "sidebar.settings": "Settings",
   "settings.widgetMode": "Widget mode",
-  "settings.widgetModeTip": "Keep Pane pinned on screen as a movable, collapsible widget — it stays visible instead of auto-hiding.",
-  "widget.barTitle": "Pane widget bar",
+  "settings.widgetModeTip": "Keep rice monitor pinned on screen as a movable, collapsible widget — it stays visible instead of auto-hiding.",
+  "widget.barTitle": "rice monitor widget bar",
   "widget.collapse": "Collapse to bar",
   "widget.expand": "Expand",
   "widget.minimize": "Minimize to tray",
@@ -243,7 +243,6 @@ const en: Dict = {
   "footer.shortcutSaved": "Shortcut saved",
   "footer.shortcutCleared": "Shortcut cleared",
   "footer.proxySaved": "Proxy saved — takes effect after restart",
-  "footer.autostartFailed": "Autostart failed: {err}",
   "footer.copied": "Copied to clipboard",
   "footer.shareFailed": "Share failed: {err}",
   "footer.updateFailed": "Update failed: {err}",
@@ -279,7 +278,6 @@ const en: Dict = {
   "settings.refreshEvery": "Refresh every",
   "settings.refreshHelp": "Shared by platforms with quota auto-refresh enabled and enabled local statistics. Choose each platform’s auto-refresh setting in Platform management. Manual Refresh / Ctrl+R remains available.",
   "settings.min": "min",
-  "settings.startWithWindows": "Start with Windows",
   "settings.pacing": "Always show pacing",
   "settings.trayShows": "Tray icon shows",
   "settings.pinAuto": "Auto (first live metric)",
@@ -339,7 +337,7 @@ const en: Dict = {
 
   "settings.codexDirs": "Codex session folders",
   "settings.codexDirsNote":
-    "Include Codex sessions from other machines. Sync or copy their ~/.codex folder (or its sessions folder) to this PC with OneDrive, Syncthing or scp, then add the folder here. Pane only reads it, and counts each session once.",
+    "Include Codex sessions from other machines. Sync or copy their ~/.codex folder (or its sessions folder) to this PC with OneDrive, Syncthing or scp, then add the folder here. rice monitor only reads it, and counts each session once.",
   "settings.codexDirsAdd": "Add",
   "settings.codexDirsAdded": "Folder added",
   "settings.codexDirsRemoved": "Folder removed",
@@ -392,8 +390,8 @@ const en: Dict = {
   "dialog.changelog": "Changelog",
   "dialog.whatsNew": "What's new in v{version}",
 
-  "star.title": "Enjoying Pane?",
-  "star.body": "If Pane saves you time, a star on GitHub helps this open-source project get found. It takes two seconds.",
+  "star.title": "Enjoying rice monitor?",
+  "star.body": "If rice monitor saves you time, a star on GitHub helps this open-source project get found. It takes two seconds.",
   "star.go": "Star on GitHub",
   "star.later": "Maybe later",
   "star.never": "Don't ask again",
@@ -444,15 +442,15 @@ const en: Dict = {
   "stale.lastFailed": "The last refresh failed",
   "stale.reloginDefault":
     "add the API key again in Settings (or sign in with the tool once)",
-  "stale.fixRetry": "Pane keeps retrying automatically — nothing to do unless this persists.",
-  "stale.fixDone": "Pane recovers automatically once that's done.",
-  "stale.fixRelogin": "Fix: {how} — Pane picks it up on the next refresh.",
+  "stale.fixRetry": "rice monitor keeps retrying automatically — nothing to do unless this persists.",
+  "stale.fixDone": "rice monitor recovers automatically once that's done.",
+  "stale.fixRelogin": "Fix: {how} — rice monitor picks it up on the next refresh.",
   "stale.fix429":
-    "The vendor is rate-limiting; Pane waits exactly as long as it asked, then retries by itself.",
+    "The vendor is rate-limiting; rice monitor waits exactly as long as it asked, then retries by itself.",
   "stale.fix5xx":
-    "The vendor's API is having trouble; Pane retries automatically until it recovers.",
+    "The vendor's API is having trouble; rice monitor retries automatically until it recovers.",
   "stale.fixNet":
-    "Pane couldn't reach the vendor — check your internet connection (or the proxy in Settings).",
+    "rice monitor couldn't reach the vendor — check your internet connection (or the proxy in Settings).",
   "stale.manualDone": "Complete the step above before trying again.",
   "stale.manualRelogin": "Fix: {how}.",
   "stale.manual429": "The provider is rate-limiting requests. Wait for the cooldown before trying again.",
@@ -612,7 +610,7 @@ const en: Dict = {
   "cap.valueSoFar": "{cost} · {n} so far",
   "cap.collecting": "collecting…",
 
-  "share.tagline": "Monitor Your AI Subscriptions with Pane",
+  "share.tagline": "Monitor Your AI Subscriptions with rice monitor",
   "tray.left": "{label}: {n}% left",
 
   "detail.unlimited": "Unlimited",
@@ -650,7 +648,7 @@ const zh: Dict = {
 
   "platform.experimental": "实验性",
   "settings.commandcodeExperimental": "实验性 GOAT 额度集成。认证和响应结构兼容性尚未经过真实账号验证。",
-  "settings.commandcodeKeyHelp": "在此输入 CommandCode API 密钥；Pane 不读取 CommandCode CLI 凭据。保存不会授权查询。请分别启用平台和账号，再手动刷新。留空后点击保存可移除已存密钥。",
+  "settings.commandcodeKeyHelp": "在此输入 CommandCode API 密钥；rice monitor 不读取 CommandCode CLI 凭据。保存不会授权查询。请分别启用平台和账号，再手动刷新。留空后点击保存可移除已存密钥。",
   "stale.relogin.commandcode": "在平台管理中核对 CommandCode API 密钥",
   "metric.monthlyCreditsRemaining": "月度剩余额度",
   "metric.purchasedCredits": "已购额度",
@@ -847,8 +845,8 @@ const zh: Dict = {
   "sidebar.customize": "平台管理",
   "sidebar.settings": "设置",
   "settings.widgetMode": "小组件模式",
-  "settings.widgetModeTip": "让 Pane 作为可移动、可折叠的小组件固定在屏幕上——保持可见，不再自动隐藏。",
-  "widget.barTitle": "Pane 小组件栏",
+  "settings.widgetModeTip": "让 rice monitor 作为可移动、可折叠的小组件固定在屏幕上——保持可见，不再自动隐藏。",
+  "widget.barTitle": "rice monitor 小组件栏",
   "widget.collapse": "折叠成细条",
   "widget.expand": "展开",
   "widget.minimize": "最小化到托盘",
@@ -865,7 +863,6 @@ const zh: Dict = {
   "footer.shortcutSaved": "快捷键已保存",
   "footer.shortcutCleared": "快捷键已清除",
   "footer.proxySaved": "代理已保存 — 重启后生效",
-  "footer.autostartFailed": "开机启动失败：{err}",
   "footer.copied": "已复制到剪贴板",
   "footer.shareFailed": "分享失败：{err}",
   "footer.updateFailed": "更新失败：{err}",
@@ -901,7 +898,6 @@ const zh: Dict = {
   "settings.refreshEvery": "刷新间隔",
   "settings.refreshHelp": "供已开启自动刷新配额的平台及已启用的本地统计共用。各平台的自动刷新开关在「平台管理」中设置；仍可用全局刷新 / Ctrl+R 手动查询。",
   "settings.min": "分钟",
-  "settings.startWithWindows": "开机启动",
   "settings.pacing": "始终显示消耗速度",
   "settings.trayShows": "托盘图标显示",
   "settings.pinAuto": "自动（第一个可用指标）",
@@ -958,7 +954,7 @@ const zh: Dict = {
 
   "settings.codexDirs": "Codex 会话目录",
   "settings.codexDirsNote":
-    "把其他电脑上的 Codex 会话算进来。用 OneDrive、Syncthing 或 scp 把它们的 ~/.codex 目录（或其中的 sessions 目录）同步/复制到这台电脑，然后在这里添加该目录。Pane 只读取它，每个会话只计一次。",
+    "把其他电脑上的 Codex 会话算进来。用 OneDrive、Syncthing 或 scp 把它们的 ~/.codex 目录（或其中的 sessions 目录）同步/复制到这台电脑，然后在这里添加该目录。rice monitor 只读取它，每个会话只计一次。",
   "settings.codexDirsAdd": "添加",
   "settings.codexDirsAdded": "已添加目录",
   "settings.codexDirsRemoved": "已移除目录",
@@ -1011,8 +1007,8 @@ const zh: Dict = {
   "dialog.changelog": "更新日志",
   "dialog.whatsNew": "v{version} 有什么新内容",
 
-  "star.title": "喜欢 Pane 吗？",
-  "star.body": "如果 Pane 帮你省了时间，在 GitHub 上点个 Star 能让这个开源项目被更多人看到。只需两秒。",
+  "star.title": "喜欢 rice monitor 吗？",
+  "star.body": "如果 rice monitor 帮你省了时间，在 GitHub 上点个 Star 能让这个开源项目被更多人看到。只需两秒。",
   "star.go": "去 GitHub 点 Star",
   "star.later": "以后再说",
   "star.never": "不再提醒",
@@ -1062,11 +1058,11 @@ const zh: Dict = {
 
   "stale.lastFailed": "上次刷新失败",
   "stale.reloginDefault": "在设置里重新粘贴 API 密钥（或用该工具登录一次）",
-  "stale.fixRetry": "Pane 会自动重试 — 除非一直失败，否则不用动手。",
-  "stale.fixDone": "完成后 Pane 会自动恢复。",
-  "stale.fixRelogin": "解决方法：{how} — 下次刷新时 Pane 会接上。",
-  "stale.fix429": "对方在限流；Pane 会按对方要求的时间等待，然后自己重试。",
-  "stale.fix5xx": "对方的接口出了问题；Pane 会自动重试直到恢复。",
+  "stale.fixRetry": "rice monitor 会自动重试 — 除非一直失败，否则不用动手。",
+  "stale.fixDone": "完成后 rice monitor 会自动恢复。",
+  "stale.fixRelogin": "解决方法：{how} — 下次刷新时 rice monitor 会接上。",
+  "stale.fix429": "对方在限流；rice monitor 会按对方要求的时间等待，然后自己重试。",
+  "stale.fix5xx": "对方的接口出了问题；rice monitor 会自动重试直到恢复。",
   "stale.fixNet": "连不上对方 — 请检查网络（或设置里的代理）。",
   "stale.manualDone": "完成上述步骤后再重试。",
   "stale.manualRelogin": "解决方法：{how}。",
@@ -1222,7 +1218,7 @@ const zh: Dict = {
   "cap.valueSoFar": "{cost} · 已用 {n}",
   "cap.collecting": "统计中…",
 
-  "share.tagline": "用 Pane 盯紧你的 AI 订阅",
+  "share.tagline": "用 rice monitor 盯紧你的 AI 订阅",
   "tray.left": "{label}：剩余 {n}%",
 
   "detail.unlimited": "无限制",
@@ -1253,8 +1249,8 @@ const ru: Dict = {
   "sidebar.customize": "Управление платформами",
   "sidebar.settings": "Настройки",
   "settings.widgetMode": "Режим виджета",
-  "settings.widgetModeTip": "Держать Pane закреплённым на экране как перемещаемый, сворачиваемый виджет — он остаётся видимым вместо автоскрытия.",
-  "widget.barTitle": "Панель виджета Pane",
+  "settings.widgetModeTip": "Держать rice monitor закреплённым на экране как перемещаемый, сворачиваемый виджет — он остаётся видимым вместо автоскрытия.",
+  "widget.barTitle": "Панель виджета rice monitor",
   "widget.collapse": "Свернуть в полоску",
   "widget.expand": "Развернуть",
   "widget.minimize": "Свернуть в трей",
@@ -1271,7 +1267,6 @@ const ru: Dict = {
   "footer.shortcutSaved": "Ярлык сохранён",
   "footer.shortcutCleared": "Ярлык сброшен",
   "footer.proxySaved": "Прокси сохранён — заработает после перезапуска",
-  "footer.autostartFailed": "Автозапуск не удался: {err}",
   "footer.copied": "Скопировано в буфер",
   "footer.shareFailed": "Не удалось поделиться: {err}",
   "footer.updateFailed": "Ошибка обновления: {err}",
@@ -1299,7 +1294,6 @@ const ru: Dict = {
   "settings.langRu": "Русский",
   "settings.refreshEvery": "Обновлять каждые",
   "settings.min": "мин",
-  "settings.startWithWindows": "Запускать с Windows",
   "settings.pacing": "Всегда показывать темп",
   "settings.trayShows": "Значок в трее показывает",
   "settings.pinAuto": "Авто (первый живой показатель)",
@@ -1359,7 +1353,7 @@ const ru: Dict = {
 
   "settings.codexDirs": "Папки сессий Codex",
   "settings.codexDirsNote":
-    "Учитывайте сессии Codex с других машин. Синхронизируйте или скопируйте их папку ~/.codex (или её подпапку sessions) на этот ПК через OneDrive, Syncthing или scp и добавьте её здесь. Pane только читает её и считает каждую сессию один раз.",
+    "Учитывайте сессии Codex с других машин. Синхронизируйте или скопируйте их папку ~/.codex (или её подпапку sessions) на этот ПК через OneDrive, Syncthing или scp и добавьте её здесь. rice monitor только читает её и считает каждую сессию один раз.",
   "settings.codexDirsAdd": "Добавить",
   "settings.codexDirsAdded": "Папка добавлена",
   "settings.codexDirsRemoved": "Папка удалена",
@@ -1385,8 +1379,8 @@ const ru: Dict = {
   "dialog.changelog": "Журнал изменений",
   "dialog.whatsNew": "Что нового в v{version}",
 
-  "star.title": "Нравится Pane?",
-  "star.body": "Если Pane экономит вам время, звезда на GitHub помогает этому открытому проекту. Это займёт две секунды.",
+  "star.title": "Нравится rice monitor?",
+  "star.body": "Если rice monitor экономит вам время, звезда на GitHub помогает этому открытому проекту. Это займёт две секунды.",
   "star.go": "Поставить звезду",
   "star.later": "Позже",
   "star.never": "Больше не спрашивать",
@@ -1437,15 +1431,15 @@ const ru: Dict = {
   "stale.lastFailed": "Последнее обновление не удалось",
   "stale.reloginDefault":
     "снова вставьте ключ API в Настройках (или войдите в инструмент один раз)",
-  "stale.fixRetry": "Pane сам повторяет попытки — ничего делать не нужно, пока это не затянется.",
-  "stale.fixDone": "Pane восстановится сам, как только это будет сделано.",
-  "stale.fixRelogin": "Что сделать: {how} — Pane подхватит это при следующем обновлении.",
+  "stale.fixRetry": "rice monitor сам повторяет попытки — ничего делать не нужно, пока это не затянется.",
+  "stale.fixDone": "rice monitor восстановится сам, как только это будет сделано.",
+  "stale.fixRelogin": "Что сделать: {how} — rice monitor подхватит это при следующем обновлении.",
   "stale.fix429":
-    "Сервис ограничивает частоту запросов; Pane ждёт ровно столько, сколько просили, и повторяет сам.",
+    "Сервис ограничивает частоту запросов; rice monitor ждёт ровно столько, сколько просили, и повторяет сам.",
   "stale.fix5xx":
-    "У сервиса сбой API; Pane повторяет попытки, пока тот не восстановится.",
+    "У сервиса сбой API; rice monitor повторяет попытки, пока тот не восстановится.",
   "stale.fixNet":
-    "Pane не достучался до сервиса — проверьте интернет (или прокси в Настройках).",
+    "rice monitor не достучался до сервиса — проверьте интернет (или прокси в Настройках).",
   "stale.tail": "Пока показываем последние хорошие данные.",
   "stale.relogin.claude": "запустите `claude` в терминале и войдите",
   "stale.relogin.codex": "запустите `codex login` в терминале",
@@ -1600,7 +1594,7 @@ const ru: Dict = {
   "cap.valueSoFar": "{cost} · пока {n}",
   "cap.collecting": "собираем…",
 
-  "share.tagline": "Следите за подписками ИИ с Pane",
+  "share.tagline": "Следите за подписками ИИ с rice monitor",
   "tray.left": "{label}: осталось {n}%",
 
   "detail.unlimited": "Без лимита",

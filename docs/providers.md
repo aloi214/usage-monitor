@@ -1,6 +1,6 @@
-# Pane Private providers and access modes
+# rice monitor providers and access modes
 
-Pane Private has **23 provider families**: the previous **22 are retained**, with experimental CommandCode added. One/New API and Sub2API are removed, including their site/key management and supported local API entries. Retaining a provider does not mean granting it permission or guaranteeing that its undocumented vendor endpoints still work.
+rice monitor has **23 provider families**: the previous **22 are retained**, with experimental CommandCode added. One/New API and Sub2API are removed, including their site/key management and supported local API entries. Retaining a provider does not mean granting it permission or guaranteeing that its undocumented vendor endpoints still work.
 
 **Verification scope:** these access modes and safeguards are implemented in the private source fork. See [verification limits](private-build.md#integration-status). No real-account, native Windows, or rendered UI validation is implied by this reference.
 

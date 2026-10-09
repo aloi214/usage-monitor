@@ -1,4 +1,4 @@
-# Pane Private local HTTP API
+# rice monitor local HTTP API
 
 The running desktop app starts a read-only HTTP listener for local scripts and widgets. It exposes already-published, currently authorized account snapshots. Requests do not query a provider, refresh credentials, enable an account, or scan logs.
 
@@ -91,6 +91,6 @@ The API cannot redeem credits or change any settings. Use normal app controls fo
 - **No authentication:** local processes, and other users able to connect on the same machine, may read these snapshots. Do not forward this port or expose it through a proxy to untrusted clients.
 - **No CORS headers:** ordinary browser cross-origin reads are restricted. Native clients such as curl and PowerShell are unaffected.
 - **Host check:** accepted names are `127.0.0.1`, `localhost`, and `[::1]`, with or without `:6736`; a missing Host is also accepted. Other aliases are rejected. This helps against DNS rebinding but does not authenticate the caller.
-- **Port collision:** if binding fails, this app's API is unavailable for the session and an error is written to stderr. Another program may own the port, so do not assume a response belongs to Pane Private without checking the process.
+- **Port collision:** if binding fails, this app's API is unavailable for the session and an error is written to stderr. Another program may own the port, so do not assume a response belongs to rice monitor without checking the process.
 
 See [privacy](privacy.md) and [build verification status](private-build.md#integration-status). These source-level properties do not claim a completed native Windows or adversarial network audit.

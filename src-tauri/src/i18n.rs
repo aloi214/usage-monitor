@@ -14,9 +14,9 @@ pub fn resolved_locale(cfg: &Value) -> &'static str {
 
 pub fn quit_label(cfg: &Value) -> &'static str {
     match resolved_locale(cfg) {
-        "zh" => "退出 Pane",
-        "ru" => "Выйти из Pane",
-        _ => "Quit Pane",
+        "zh" => "退出 rice monitor",
+        "ru" => "Выйти из rice monitor",
+        _ => "Quit rice monitor",
     }
 }
 
@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(metric_label(&ru, "Rate Limit Resets"), "Сбросы лимитов");
         assert_eq!(metric_label(&ru, "Cloud credits"), "Облачные кредиты");
         assert_eq!(metric_label(&ru, "Recent models"), "Недавние модели");
-        assert_eq!(quit_label(&ru), "Выйти из Pane");
+        assert_eq!(quit_label(&ru), "Выйти из rice monitor");
     }
 
     #[test]

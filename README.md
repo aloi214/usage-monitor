@@ -1,10 +1,10 @@
-# Pane Private
+# rice monitor
 
 **English** · [简体中文](README.zh-CN.md) · [Русский](README.ru.md)
 
 A privacy-focused fork of [Pane for Windows](https://github.com/ItsJazii/pane), based on upstream commit `a55578c`. The desktop app uses Tauri, Rust, and TypeScript to show AI account limits and separately authorized local usage estimates.
 
-> This repository describes **Pane Private**, not an upstream Pane release. Upstream installers, winget packages, install scripts, and release downloads do not contain these changes. The earlier source version was reported to build and render in Windows 11 development mode. The later settings, exact-account refresh, CommandCode, and per-provider auto-refresh changes still need native acceptance testing; no private Windows installer or size reduction is verified here.
+> rice monitor starts its own version sequence at **0.0.1**. Upstream installers, winget packages, install scripts, and downloads do not contain this fork’s changes. The predecessor source passed Windows CI tests and NSIS packaging; that does not verify this renamed build, native installation, tray behavior, or real accounts. See the current PR checks and [upgrade notes](docs/rice-monitor-0.0.1.md).
 
 ## Start here
 
@@ -23,6 +23,8 @@ A privacy-focused fork of [Pane for Windows](https://github.com/ItsJazii/pane), 
 
 ## Private-fork behavior
 
+- No launch at Windows sign-in. The app removes its owned legacy startup registration when it can verify the executable path; there is no autostart toggle or reset path. See [migration limits](docs/rice-monitor-0.0.1.md).
+
 - Upstream telemetry and automatic updates are removed. Updates are installed manually from this repository’s reviewed Releases, when available, or by rebuilding reviewed source.
 - Account permissions start off. **Platform management** is the single place for provider/account permissions, region/connection modes, keys, and metrics/layout. A platform’s **Queries** switch permits individual account choices; it does not authorize them. Turning it off revokes that platform’s account queries and refreshes. Metric visibility only changes the display.
 - **Auto-refresh quotas** is separate from account permission and shared by each family’s extra accounts. Claude and CommandCode default off; other account-query providers default on, while all account grants still start off. Off retains applicable saved results and permits authorized card/global manual refresh. Hermes is local-only and has no quota-auto switch.
@@ -35,7 +37,7 @@ Account quotas and log-derived spend answer different questions. A log estimate 
 
 ## Credits and license
 
-Pane Private retains the upstream [MIT license](LICENSE) and attribution:
+rice monitor retains the upstream [MIT license](LICENSE) and attribution:
 
 - © 2026 Jazii, [Pane for Windows](https://github.com/ItsJazii/pane)
 - © 2025 Robin Ebers, [OpenUsage for macOS](https://github.com/robinebers/openusage), original concept and provider research
@@ -43,4 +45,4 @@ Pane Private retains the upstream [MIT license](LICENSE) and attribution:
 
 Thanks also to [Tauri](https://tauri.app/), [LiteLLM](https://github.com/BerriAI/litellm), [models.dev](https://models.dev/), [prasen.dev](https://www.prasen.dev/), and [shadcn/ui](https://ui.shadcn.com/) for upstream components, data, and visual techniques. Provider names and logos belong to their owners; this fork is not endorsed by those providers or the upstream projects.
 
-`CHANGELOG.md` records upstream history; it is not a release or security-verification record for Pane Private.
+`RICE_CHANGELOG.md` records rice monitor changes. `CHANGELOG.md` records upstream history; it is not a release or security-verification record for rice monitor.

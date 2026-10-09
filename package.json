@@ -1,7 +1,7 @@
 {
-  "name": "pane",
+  "name": "rice-monitor",
   "private": true,
-  "version": "0.4.57",
+  "version": "0.0.1",
   "type": "module",
   "scripts": {
     "dev": "vite",

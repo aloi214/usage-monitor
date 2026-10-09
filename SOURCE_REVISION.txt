@@ -1,12 +1,11 @@
-Pane Private / usage-monitor — Zhipu and Kimi quota-window fixes, 2026-10-08
-GitHub base: aloi214/usage-monitor main at 9fa6f657c3c3c67968529b24413f4bf68bc4722c
-Verified local product revision: 588298e22d7b775e2c26d209a80ac5c0f9ecfa90
-The local verification revision identifies the tested source, not a promised GitHub commit ID. Publication verifies file/tree equality.
+rice monitor 0.0.1 — product rename and no launch-at-login, 2026-10-09
+GitHub base: aloi214/usage-monitor main at 169dc9fed43ea1b7aca22d311a9cb22f827bcac1
 Upstream source base: a55578c7b10c2ef1d136dc4decaefcaa0fb7a15e
 
-Zhipu/Z.ai keeps independent five-hour and weekly token quota windows and reset times.
-Kimi supports official ratio-based Session/Weekly/shared Monthly pools and legacy responses without inventing monthly duration or absolute token counts.
-Saved layout, hidden/on-demand, star and pin selections migrate to observed quota windows.
-Read docs/quota-window-fix.md for behavior, sources, verification and limits.
-Source code only. Native Windows/WebView2, real account responses and installation remain unverified for this revision.
+The product uses a new name/version sequence while retaining local.pane.private and PanePrivate data compatibility.
+App startup, Settings, and Reset All no longer enable launch-at-login.
+Read docs/rice-monitor-0.0.1.md for narrowly scoped old startup cleanup, installation migration and limits.
+Read docs/quota-window-fix.md for the retained Zhipu/Z.ai and Kimi quota-window fixes.
+This change does not create, move or replace any tag/Release. Current PR/CI results are the verification source.
+Native Windows installation, sign-in behavior, real accounts and runtime acceptance are not established by source or packaging checks.
 MANIFEST.sha256 lists every tracked source file except itself.
