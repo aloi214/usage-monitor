@@ -35,7 +35,7 @@ Get-FileHash .\src-tauri\target\release\bundle\nsis\*-setup.exe -Algorithm SHA25
 
 `npm run tauri build` 会先运行前端生产构建，并按当前默认配置生成 NSIS。需要显式指定格式时可用 `npm run tauri build -- --bundles nsis`。
 
-NSIS 输出通常在 `src-tauri/target/release/bundle/nsis/`。上述路径假设使用默认 Cargo target 目录；设置 `CARGO_TARGET_DIR`、Cargo `target-dir` 或显式目标 triple 会改变位置。手动 GitHub Actions 工作流使用同样的 NSIS 配置，缺少安装包产物时会报错；修改工作流文件不会自动触发运行。
+NSIS 输出通常在 `src-tauri/target/release/bundle/nsis/`。上述路径假设使用默认 Cargo target 目录；设置 `CARGO_TARGET_DIR`、Cargo `target-dir` 或显式目标 triple 会改变位置。GitHub Actions 使用同样的 NSIS 配置，缺少安装包产物时会报错。原有手动工作流仍可选择分支运行；新增的 PR 自动检查与版本标签发布流程见 [GitHub 自动检查与 Windows 发布](github-releases.md)。合并 PR 不会自动创建 Release。
 
 ## 还没有测量或验证的部分
 
