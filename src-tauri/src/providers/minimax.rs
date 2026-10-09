@@ -963,6 +963,12 @@ fn read_events_stmt(
 
 #[cfg(test)]
 mod tests {
+    // Match ScanPolicy's canonical authority spelling, including Windows
+    // verbatim prefixes and expanded short names, before creating children.
+    fn fixture_temp_dir() -> std::path::PathBuf {
+        std::env::temp_dir().canonicalize().expect("canonical fixture temp directory")
+    }
+
     use super::cli_config_key;
     use serde_json::json;
 
@@ -998,8 +1004,8 @@ mod tests {
     fn snapshot_db_deletes_leftover_wal_before_copy() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("minimax".into(), vec![std::env::temp_dir()])])).unwrap().enter("minimax");
         let pid = std::process::id();
-        let src = std::env::temp_dir().join(format!("pane-snap-src-{pid}.db"));
-        let dst = std::env::temp_dir().join(format!("pane-snap-dst-{pid}.db"));
+        let src = fixture_temp_dir().join(format!("pane-snap-src-{pid}.db"));
+        let dst = fixture_temp_dir().join(format!("pane-snap-dst-{pid}.db"));
         crate::providers::remove_sqlite_files(&src);
         crate::providers::remove_sqlite_files(&dst);
 
@@ -1163,7 +1169,7 @@ mod tests {
     #[test]
     fn remembered_tier_round_trips_and_survives_login_lapse() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("minimax".into(), vec![std::env::temp_dir()])])).unwrap().enter("minimax");
-        let dir = std::env::temp_dir().join(format!("pane-mmx-plan-{}", std::process::id()));
+        let dir = fixture_temp_dir().join(format!("pane-mmx-plan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(super::remembered_tier_in(&dir), None);
 
@@ -1197,7 +1203,7 @@ mod tests {
     fn remembered_tier_expires_after_ttl() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("minimax".into(), vec![std::env::temp_dir()])])).unwrap().enter("minimax");
         let dir =
-            std::env::temp_dir().join(format!("pane-mmx-plan-ttl-{}", std::process::id()));
+            fixture_temp_dir().join(format!("pane-mmx-plan-ttl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         super::remember_tier_in(&dir, "Ultra Plan", "42");
         let now = chrono::Utc::now().timestamp_millis();
@@ -1245,7 +1251,7 @@ mod tests {
     fn remembered_tier_rewrites_when_user_changes() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("minimax".into(), vec![std::env::temp_dir()])])).unwrap().enter("minimax");
         let dir =
-            std::env::temp_dir().join(format!("pane-mmx-plan-usr-{}", std::process::id()));
+            fixture_temp_dir().join(format!("pane-mmx-plan-usr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         super::remember_tier_in(&dir, "Ultra Plan", "1");
         let mtime = std::fs::metadata(super::plan_cache_path(&dir))
@@ -1277,7 +1283,7 @@ mod tests {
     fn remembered_tier_refreshes_seen_ms_before_ttl() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("minimax".into(), vec![std::env::temp_dir()])])).unwrap().enter("minimax");
         let dir =
-            std::env::temp_dir().join(format!("pane-mmx-plan-refresh-{}", std::process::id()));
+            fixture_temp_dir().join(format!("pane-mmx-plan-refresh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let now = chrono::Utc::now().timestamp_millis();
         // 16 days old — past the half-TTL refresh point but still valid.
@@ -1322,7 +1328,7 @@ mod tests {
     fn forget_remembered_tier_removes_cache_and_is_idempotent() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("minimax".into(), vec![std::env::temp_dir()])])).unwrap().enter("minimax");
         let dir =
-            std::env::temp_dir().join(format!("pane-mmx-plan-rm-{}", std::process::id()));
+            fixture_temp_dir().join(format!("pane-mmx-plan-rm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         super::remember_tier_in(&dir, "Ultra Plan", "1");
         assert!(super::remembered_tier_exists_in(&dir));
@@ -1338,7 +1344,7 @@ mod tests {
     fn stash_restore_discard_round_trip() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("minimax".into(), vec![std::env::temp_dir()])])).unwrap().enter("minimax");
         let dir =
-            std::env::temp_dir().join(format!("pane-mmx-plan-stash-{}", std::process::id()));
+            fixture_temp_dir().join(format!("pane-mmx-plan-stash-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cache = super::plan_cache_path(&dir);
         let stash = dir.join("minimax-plan.json.old");
@@ -1367,7 +1373,7 @@ mod tests {
     fn stale_refresh_does_not_rewrite_tier_after_key_change() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("minimax".into(), vec![std::env::temp_dir()])])).unwrap().enter("minimax");
         let dir =
-            std::env::temp_dir().join(format!("pane-mmx-plan-stale-{}", std::process::id()));
+            fixture_temp_dir().join(format!("pane-mmx-plan-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         // A generation captured before a key-driven cleanup is stale: the
@@ -1398,7 +1404,7 @@ mod tests {
     fn tier_cache_mutations_serialize_with_remember() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("minimax".into(), vec![std::env::temp_dir()])])).unwrap().enter("minimax");
         let dir =
-            std::env::temp_dir().join(format!("pane-mmx-plan-lock-{}", std::process::id()));
+            fixture_temp_dir().join(format!("pane-mmx-plan-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         // Key-change cleanups racing the mcode write path must not panic
@@ -1499,7 +1505,7 @@ mod tests {
     fn v2_ledger_joins_model_from_message_telemetry() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("minimax".into(), vec![std::env::temp_dir()])])).unwrap().enter("minimax");
         let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!("pane-mmx-v2-{pid}"));
+        let dir = fixture_temp_dir().join(format!("pane-mmx-v2-{pid}"));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("runtime-state.sqlite");
         crate::providers::remove_sqlite_files(&db);

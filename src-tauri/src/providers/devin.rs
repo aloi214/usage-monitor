@@ -52,6 +52,12 @@ pub async fn snapshot() -> Snapshot {
 
 #[cfg(test)]
 mod tests {
+    // Match ScanPolicy's canonical authority spelling, including Windows
+    // verbatim prefixes and expanded short names, before creating children.
+    fn fixture_temp_dir() -> std::path::PathBuf {
+        std::env::temp_dir().canonicalize().expect("canonical fixture temp directory")
+    }
+
     use super::*;
 
     #[test]
@@ -66,7 +72,7 @@ mod tests {
     }
 
     fn temp_db(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        let path = fixture_temp_dir().join(format!(
             "pane-devin-test-{name}-{}.db",
             std::process::id()
         ));
@@ -378,7 +384,7 @@ mod tests {
     #[test]
     fn devin_cache_roundtrip_and_version_gate() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("devin".into(), vec![std::env::temp_dir()])])).unwrap().enter("devin");
-        let path = std::env::temp_dir().join(format!(
+        let path = fixture_temp_dir().join(format!(
             "pane-devin-test-cache-{}.json",
             std::process::id()
         ));
@@ -420,7 +426,7 @@ mod tests {
     #[test]
     fn devin_save_cache_creates_missing_config_dir() {
         let _scan_scope = crate::scan_policy::ScanPolicy::new(std::collections::BTreeMap::from([("devin".into(), vec![std::env::temp_dir()])])).unwrap().enter("devin");
-        let dir = std::env::temp_dir().join(format!(
+        let dir = fixture_temp_dir().join(format!(
             "pane-devin-test-cachedir-{}",
             std::process::id()
         ));
